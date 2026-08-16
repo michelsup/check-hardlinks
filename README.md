@@ -79,7 +79,7 @@ Le détail de chaque réglage est commenté directement dans [`cleanup/config.co
 | 7. Normalisation | `STOPWORDS` | Mots ignorés lors du matching par nom de fichier |
 | 8. Cache Arr | `ARR_CACHE_DURATION` | Durée de validité (secondes) du cache des inodes Arr |
 | — | `TORRENT_STATUS_TTL` | Durée de validité (secondes) d'un statut de torrent mis en cache — défaut 86400 (24 h) |
-| 9. Orphelins de disque | `SCAN_DISK_ORPHANS`, `DISK_ORPHAN_LOG`, `DISK_ORPHAN_MIN_SIZE`, `DISK_ORPHAN_EXTENSIONS` | Phase 7 : fichiers de bibliothèque non référencés |
+| 9. Orphelins de disque | `SCAN_DISK_ORPHANS`, `DISK_ORPHAN_LOG`, `DISK_ORPHAN_PATHS_FILE`, `DISK_ORPHAN_MIN_SIZE`, `DISK_ORPHAN_EXTENSIONS` | Phase 7 : fichiers de bibliothèque non référencés |
 
 ### Durée minimale de seed par tracker
 
@@ -152,6 +152,35 @@ Le script raisonne par **inode** : deux chemins qui partagent un inode sont le m
 **Mémoïsation des parcours** : le répertoire d'un même torrent était parcouru jusqu'à quatre fois par run (Phases 2, 3, 4 et 5). Le résultat est désormais mémoïsé pour la durée du run, puis invalidé après la Phase 5 (qui change les inodes en créant des hardlinks). Le mémo est écrit dans `TMPDIR`, résolu de préférence sur un tmpfs (`/dev/shm`) : ces fichiers éphémères restent donc en RAM plutôt que d'être infligés au pool de stockage. Définir `TMPDIR` explicitement force un autre emplacement.
 
 **Performance du chargement du cache torrents** : la traduction de chemin (`translate_path`, Docker → hôte via `PATH_MAP`) refaisait un tri complet des préfixes (`awk`+`sort`+`cut`, donc 3 process externes) à **chaque appel**, alors qu'elle est appelée une fois par torrent au chargement du cache. Sur une grosse liste de torrents, ça pouvait à lui seul représenter l'essentiel du temps de démarrage. Le tri est maintenant calculé une seule fois et mis en cache, `PATH_MAP` ne changeant jamais en cours de run.
+
+### Exploiter les orphelins de disque depuis un autre script
+
+La Phase 7 produit deux fichiers distincts :
+
+| Fichier | Destinataire | Format |
+|---|---|---|
+| `DISK_ORPHAN_LOG` | lecture humaine | en-tête daté, puis `inode<TAB>taille<TAB>chemin` |
+| `DISK_ORPHAN_PATHS_FILE` | script annexe | un chemin absolu par ligne, rien d'autre |
+
+La liste des chemins est triée (donc comparable au `diff` d'un run à l'autre) et basculée par `mv` en fin de phase : un script qui la lit pendant un scan ne verra jamais de liste partielle.
+
+**Contrat à respecter si votre script supprime des fichiers :**
+
+| État du fichier | Signification | Action attendue |
+|---|---|---|
+| présent, non vide | ces chemins sont orphelins | traiter |
+| présent, vide | aucun orphelin | ne rien faire |
+| **absent** | la Phase 7 n'a pas pu conclure (API Arr injoignable) ou n'a pas tourné | **s'abstenir** — ne jamais réutiliser une liste précédente |
+
+Le fichier est volontairement vidé quand il n'y a plus d'orphelin, et supprimé quand la phase abandonne : dans les deux cas, il ne doit jamais rester une liste périmée sur laquelle un script agirait à tort.
+
+```bash
+while IFS= read -r f; do
+    echo "à traiter : $f"
+done < cleanup/disk_orphans_paths.txt
+```
+
+Limite : un chemin contenant un retour à la ligne ne peut pas être représenté dans ce format (inexistant en pratique pour des fichiers média).
 
 ## Tags appliqués
 

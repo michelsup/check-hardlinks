@@ -62,6 +62,10 @@ ARR_CACHE_DURATION="${ARR_CACHE_DURATION:-3600}"
 AUTO_REPAIR="${AUTO_REPAIR:-false}"
 SCAN_DISK_ORPHANS="${SCAN_DISK_ORPHANS:-false}"
 DISK_ORPHAN_LOG="${DISK_ORPHAN_LOG:-${SCRIPT_DIR}/disk_orphans.log}"
+# Liste exploitable par un script tiers : un chemin absolu par ligne, rien
+# d'autre — ni en-tête, ni commentaire, ni colonne supplémentaire. Le fichier
+# DISK_ORPHAN_LOG reste, lui, un rapport destiné à la lecture humaine.
+DISK_ORPHAN_PATHS_FILE="${DISK_ORPHAN_PATHS_FILE:-${SCRIPT_DIR}/cleanup/disk_orphans_paths.txt}"
 DISK_ORPHAN_MIN_SIZE="${DISK_ORPHAN_MIN_SIZE:-0}"
 CROSS_SEED_DIR="${CROSS_SEED_DIR:-}"
 
@@ -1921,6 +1925,11 @@ phase7_scan_disk_orphans() {
     if [ "$api_inodes" -eq 0 ]; then
         printf "   ⚠️  Aucun fichier revendiqué par l’API Radarr/Sonarr : impossible de\n" >&2
         printf "      distinguer un orphelin d’un fichier géré. Phase ignorée.\n" >&2
+        # On supprime la liste exploitable plutôt que de laisser en place
+        # celle du run précédent : un script tiers qui agirait dessus
+        # travaillerait sur des données périmées, potentiellement pour
+        # supprimer des fichiers redevenus légitimes entre-temps.
+        rm -f "$DISK_ORPHAN_PATHS_FILE" 2>/dev/null
         printf '═══════════════════════════════════════════════════════════════\n\n'
         return 1
     fi
@@ -1939,6 +1948,15 @@ phase7_scan_disk_orphans() {
         printf '# Fichiers présents dans MEDIA_DIRS mais ni connus ARR ni liés torrent\n'
         printf '# inode\ttaille\tchemin\n'
     } > "$disk_orphan_log"
+
+    # Liste exploitable par un script annexe. Elle est construite dans un
+    # fichier temporaire puis basculée par `mv` (rename atomique) en toute
+    # fin de phase : un script tiers qui lirait le fichier pendant le scan
+    # ne verra jamais une liste partielle, seulement l'ancienne version
+    # complète ou la nouvelle.
+    local paths_tmp
+    mkdir -p "$(dirname "$DISK_ORPHAN_PATHS_FILE")" 2>/dev/null
+    paths_tmp=$(mktemp "${DISK_ORPHAN_PATHS_FILE}.XXXXXX") || paths_tmp=""
 
     # Indexation rapide : inodes déjà connus par les torrents (tous les
     # fichiers, pas seulement les extensions média, pour ne pas rater un
@@ -1996,6 +2014,7 @@ phase7_scan_disk_orphans() {
             disk_orphan_count=$((disk_orphan_count + 1))
             disk_orphan_bytes=$((disk_orphan_bytes + fsize))
             printf '%s\t%s\t%s\n' "$finode" "$fsize" "$fpath" >> "$disk_orphan_log"
+            [ -n "$paths_tmp" ] && printf '%s\n' "$fpath" >> "$paths_tmp"
             printf '      ⚠️  %s\n' "$fpath"
 
         done < <(scan_files "$ext_csv" "$media_dir")
@@ -2003,13 +2022,31 @@ phase7_scan_disk_orphans() {
         printf '   ✓ [%d/%d] terminé\n' "$dir_num" "$dir_total"
     done
 
+    # Bascule atomique de la liste exploitable. Elle est réécrite même quand
+    # il n'y a aucun orphelin (fichier vide) : laisser en place celle du run
+    # précédent ferait agir un script annexe sur des fichiers qui ne sont
+    # plus orphelins. Tri pour que le contenu soit stable d'un run à l'autre
+    # — l'ordre de parcours de MEDIA_DIRS (tableau associatif) ne l'est pas,
+    # et une liste triée se compare au diff entre deux exécutions.
+    if [ -n "$paths_tmp" ]; then
+        sort -o "$paths_tmp" "$paths_tmp" 2>/dev/null
+        if mv -f "$paths_tmp" "$DISK_ORPHAN_PATHS_FILE" 2>/dev/null; then
+            chmod 644 "$DISK_ORPHAN_PATHS_FILE" 2>/dev/null
+        else
+            rm -f "$paths_tmp" 2>/dev/null
+            printf '   ⚠️  Écriture de %s impossible\n' "$DISK_ORPHAN_PATHS_FILE" >&2
+        fi
+    fi
+
     if [ "$disk_orphan_count" -gt 0 ]; then
         local human_size
         human_size=$(numfmt --to=iec-i --suffix=B "$disk_orphan_bytes" 2>/dev/null || echo "${disk_orphan_bytes}o")
         printf '   ⚠️  %d fichier(s) orphelin(s) trouvé(s) : %s\n' "$disk_orphan_count" "$human_size"
-        printf '   📄 Rapport : %s\n' "$disk_orphan_log"
+        printf '   📄 Rapport détaillé : %s\n' "$disk_orphan_log"
+        printf '   📋 Liste des chemins : %s\n' "$DISK_ORPHAN_PATHS_FILE"
     else
         printf '   ✓ Aucun orphelin de disque\n'
+        printf '   📋 Liste des chemins vidée : %s\n' "$DISK_ORPHAN_PATHS_FILE"
     fi
     printf '═══════════════════════════════════════════════════════════════\n\n'
 }

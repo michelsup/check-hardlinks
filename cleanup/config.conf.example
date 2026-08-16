@@ -132,8 +132,27 @@ TORRENT_STATUS_TTL=86400
 # bibliothèque ressemblerait à un orphelin.
 SCAN_DISK_ORPHANS=false
 
-# Chemin du rapport (log) à générer.
+# Chemin du rapport (log) à générer — destiné à la lecture humaine :
+# en-tête daté puis "inode<TAB>taille<TAB>chemin" par orphelin.
 DISK_ORPHAN_LOG="${SCRIPT_DIR}/cleanup/disk_orphans.log"
+
+# Liste exploitable par un script annexe : un chemin absolu par ligne, rien
+# d'autre (ni en-tête, ni commentaire, ni colonne). Triée, donc comparable
+# au diff d'un run à l'autre, et écrite de façon atomique — un script qui la
+# lit pendant un scan ne verra jamais de liste partielle.
+#
+# Contrat, important si le script annexe supprime des fichiers :
+#   - fichier présent et vide  -> il n'y a aucun orphelin, ne rien faire
+#   - fichier absent           -> la Phase 7 n'a pas pu conclure (API Arr
+#                                 injoignable) ou n'a jamais tourné :
+#                                 s'abstenir, surtout ne pas réutiliser une
+#                                 liste précédente
+# Limite : un chemin contenant un retour à la ligne ne peut pas être
+# représenté dans ce format (cas inexistant pour des fichiers média réels).
+#
+# Exemple de consommation :
+#   while IFS= read -r f; do echo "à traiter : $f"; done < cleanup/disk_orphans_paths.txt
+DISK_ORPHAN_PATHS_FILE="${SCRIPT_DIR}/cleanup/disk_orphans_paths.txt"
 
 # Taille minimale (en octets) pour ignorer les images/subs/NFO.
 # 52428800 = 50 MiB. Mettre 0 pour tout lister.
