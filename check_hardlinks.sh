@@ -133,6 +133,7 @@ UNCACHED_TMP=""
 # -----------------------------------------------------------------------------
 NO_CACHE=false
 DRY_RUN=false
+DEBUG=false
 
 print_usage() {
     cat <<EOF
@@ -149,6 +150,12 @@ Options :
                     ni tag ajouté/retiré dans qBittorrent. Force AUTO_REPAIR
                     à true le temps du run pour prévisualiser les réparations
                     qui seraient tentées, sans jamais les appliquer.
+  --debug          Affiche des informations de diagnostic détaillées sur
+                    stderr (préfixées "🐛 [DEBUG]") : requêtes API qBittorrent/
+                    Arr avec code HTTP, traduction de chemins, diagnostic complet
+                    de chaque tentative de hardlink, hashs comparés en Phase 5.
+                    N'affecte pas la sortie normale (stdout) du script — pratique
+                    pour rediriger : ./check_hardlinks.sh --debug 2> debug.log
   -h, --help       Affiche cette aide et quitte.
 EOF
 }
@@ -157,6 +164,7 @@ for arg in "$@"; do
     case "$arg" in
         --use-no-cache) NO_CACHE=true ;;
         --dry-run) DRY_RUN=true ;;
+        --debug) DEBUG=true ;;
         -h|--help) print_usage; exit 0 ;;
         *)
             printf '❌ Option inconnue : %s\n\n' "$arg" >&2
@@ -165,6 +173,14 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Log de diagnostic (silencieux sauf --debug), toujours sur stderr pour ne
+# jamais polluer la sortie normale ni les valeurs retournées par les
+# fonctions qui impriment leur résultat sur stdout (ex. translate_path).
+debug_log() {
+    $DEBUG && printf '   🐛 [DEBUG] %s\n' "$*" >&2
+    return 0
+}
 
 if $NO_CACHE; then
     TORRENT_CACHE_DURATION=0
@@ -258,18 +274,27 @@ translate_path() {
     fi
 
     local host_path="$container_path"
-    local container_prefix
+    local container_prefix matched=""
     for container_prefix in $(printf '%s\n' "${!PATH_MAP[@]}" | awk '{print length, $0}' | sort -nr | cut -d' ' -f2-); do
         if [[ "$container_path" == "$container_prefix"/* ]]; then
             local suffix="${container_path#$container_prefix/}"
             host_path="${PATH_MAP[$container_prefix]%/}/${suffix}"
+            matched="$container_prefix"
             break
         elif [[ "$container_path" == "$container_prefix" ]]; then
             host_path="${PATH_MAP[$container_prefix]}"
             host_path="${host_path%/}"
+            matched="$container_prefix"
             break
         fi
     done
+    if $DEBUG; then
+        if [ -n "$matched" ]; then
+            debug_log "translate_path : $container_path (préfixe PATH_MAP[$matched]) → $host_path"
+        else
+            debug_log "translate_path : $container_path → $host_path (aucun préfixe PATH_MAP ne correspond, inchangé)"
+        fi
+    fi
     printf '%s' "$host_path"
 }
 
@@ -567,6 +592,7 @@ qbit_login() {
     local vars
     vars=$(qbit_vars "$instance") || return 1
     IFS='|' read -r url user pass <<< "$vars"
+    debug_log "qbit_login [$instance] POST ${url}/api/v2/auth/login (user=${user})"
     local cookie
     # CORRECTION : credentials URL-encodés
     cookie=$(curl -s -c - \
@@ -574,7 +600,11 @@ qbit_login() {
         --data-urlencode "password=${pass}" \
         --connect-timeout 5 --max-time 10 \
         "${url}/api/v2/auth/login" 2>/dev/null | awk '/SID/ {print $NF}')
-    [ -z "$cookie" ] && return 1
+    if [ -z "$cookie" ]; then
+        debug_log "qbit_login [$instance] échec : aucun cookie SID obtenu"
+        return 1
+    fi
+    debug_log "qbit_login [$instance] OK (cookie de ${#cookie} caractères)"
     QBIT_COOKIES["$instance"]="$cookie"
     return 0
 }
@@ -588,12 +618,14 @@ qbit_get() {
     local vars
     vars=$(qbit_vars "$instance") || return 1
     local url="${vars%%|*}"
+    debug_log "qbit_get [$instance] GET ${url}${path}"
     local response http_code
     response=$(curl -s -w "\n%{http_code}" --connect-timeout 5 --max-time 30 \
         -H "Cookie: SID=${QBIT_COOKIES[$instance]:-}" "${url}${path}" 2>/dev/null)
     http_code=$(printf '%s' "$response" | tail -n 1)
 
     if [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+        debug_log "qbit_get [$instance] HTTP $http_code → session expirée, reconnexion"
         qbit_login "$instance" || return 1
         response=$(curl -s -w "\n%{http_code}" --connect-timeout 5 --max-time 30 \
             -H "Cookie: SID=${QBIT_COOKIES[$instance]}" "${url}${path}" 2>/dev/null)
@@ -604,6 +636,7 @@ qbit_get() {
         printf '⚠️  qBittorrent [%s] %s → HTTP %s\n' "$instance" "$path" "$http_code" >&2
         return 1
     fi
+    debug_log "qbit_get [$instance] HTTP 200, $(printf '%s' "$response" | sed '$d' | wc -c) octet(s) reçus"
     printf '%s' "$response" | sed '$d'
 }
 
@@ -619,6 +652,7 @@ qbit_tag_single() {
     local vars
     vars=$(qbit_vars "$instance") || return
     local url="${vars%%|*}"
+    debug_log "qbit_tag_single [$instance] POST addTags tags=${tag} sur $(printf '%s' "$hashes" | tr '|' '\n' | grep -c .) hash(es)"
     local response http_code
     response=$(curl -s -w "\n%{http_code}" --connect-timeout 5 --max-time 30 \
         -H "Cookie: SID=${QBIT_COOKIES[$instance]:-}" \
@@ -637,7 +671,11 @@ qbit_tag_single() {
         http_code=$(printf '%s' "$response" | tail -n 1)
     fi
 
-    [ "$http_code" != "200" ] && printf '⚠️  addTags [%s] « %s » → HTTP %s\n' "$instance" "$tag" "$http_code" >&2
+    if [ "$http_code" != "200" ]; then
+        printf '⚠️  addTags [%s] « %s » → HTTP %s\n' "$instance" "$tag" "$http_code" >&2
+    else
+        debug_log "qbit_tag_single [$instance] HTTP 200"
+    fi
 }
 
 # Retire un ou plusieurs tags (liste séparée par des virgules) d'un lot de
@@ -654,6 +692,7 @@ qbit_remove_tags() {
     local vars
     vars=$(qbit_vars "$instance") || return
     local url="${vars%%|*}"
+    debug_log "qbit_remove_tags [$instance] POST removeTags tags=${tags} sur $(printf '%s' "$hashes" | tr '|' '\n' | grep -c .) hash(es)"
     local response http_code
     response=$(curl -s -w "\n%{http_code}" --connect-timeout 5 --max-time 30 \
         -H "Cookie: SID=${QBIT_COOKIES[$instance]:-}" \
@@ -672,7 +711,11 @@ qbit_remove_tags() {
         http_code=$(printf '%s' "$response" | tail -n 1)
     fi
 
-    [ "$http_code" != "200" ] && printf '⚠️  removeTags [%s] → HTTP %s\n' "$instance" "$http_code" >&2
+    if [ "$http_code" != "200" ]; then
+        printf '⚠️  removeTags [%s] → HTTP %s\n' "$instance" "$http_code" >&2
+    else
+        debug_log "qbit_remove_tags [$instance] HTTP 200"
+    fi
 }
 
 # batch_add/batch_remove n'accumulent QUE la liste en mémoire (TAG_BATCHES),
@@ -902,14 +945,16 @@ create_hardlink_atomic() {
     local source="$1" target="$2"
     local err="" err_file
 
-    printf '       🔍 Diagnostic hardlink :\n'
-    printf '          source : %s\n' "$source"
-    printf '          target : %s\n' "$target"
-    printf '          src dev: %s\n' "$(get_fs_id "$source")"
-    printf '          tgt dev: %s\n' "$(get_fs_id "$(dirname "$target")")"
-    printf '          src inode: %s\n' "$(stat -c '%i' "$source" 2>/dev/null || echo "?")"
-    printf '          tgt exists: %s\n' "$([ -e "$target" ] && echo "oui" || echo "non")"
-    printf '          parent writable: %s\n' "$([ -w "$(dirname "$target")" ] && echo "oui" || echo "NON")"
+    if $DEBUG; then
+        debug_log "Diagnostic hardlink :"
+        debug_log "  source          : $source"
+        debug_log "  target          : $target"
+        debug_log "  src dev         : $(get_fs_id "$source")"
+        debug_log "  tgt dev         : $(get_fs_id "$(dirname "$target")")"
+        debug_log "  src inode       : $(stat -c '%i' "$source" 2>/dev/null || echo "?")"
+        debug_log "  tgt exists      : $([ -e "$target" ] && echo "oui" || echo "non")"
+        debug_log "  parent writable : $([ -w "$(dirname "$target")" ] && echo "oui" || echo "NON")"
+    fi
 
     # Vérification préalable
     if [ ! -f "$source" ]; then
@@ -993,7 +1038,10 @@ try_repair_file() {
     for media_dir in "${MEDIA_DIRS[@]}"; do
         [ ! -d "$media_dir" ] && continue
         media_dev=$(get_fs_id "$media_dir")
-        [ "$orphan_dev" -ne "$media_dev" ] && continue
+        if [ "$orphan_dev" -ne "$media_dev" ]; then
+            debug_log "try_repair_file : $media_dir ignoré (device $media_dev ≠ device orphelin $orphan_dev, hardlink impossible)"
+            continue
+        fi
         local c
         while IFS= read -r -d '' c; do
             all_candidates+=("$c")
@@ -1042,6 +1090,7 @@ try_repair_file() {
     fhash=$(file_hash "$orphan_file")
     [ -z "$fhash" ] && { printf '❌\n'; return 1; }
     printf '✓ %s...\n' "${fhash:0:8}"
+    debug_log "try_repair_file : hash orphelin ($HASH_CMD) = $fhash"
 
     # Test priorité (noms similaires)
     local checked=0 cname chash
@@ -1054,6 +1103,7 @@ try_repair_file() {
             printf '❌\n'
             continue
         fi
+        debug_log "try_repair_file : hash candidat $candidate = $chash"
         if [ "$chash" = "$fhash" ]; then
             printf '✅ CORRESPONDANCE !\n'
             printf '       🔧 Hardlink...\n'
@@ -1086,6 +1136,7 @@ try_repair_file() {
                 printf '❌\n'
                 continue
             fi
+            debug_log "try_repair_file : hash candidat $candidate = $chash"
             if [ "$chash" = "$fhash" ]; then
                 printf '✅ CORRESPONDANCE (nom différent) !\n'
                 printf '       🔧 Hardlink...\n'

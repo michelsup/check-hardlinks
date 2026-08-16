@@ -95,14 +95,16 @@ tracker.autre.net=168
 ## Utilisation
 
 ```bash
-./check_hardlinks.sh                 # run normal (utilise les caches)
-./check_hardlinks.sh --use-no-cache   # ignore tous les caches, ré-analyse tout depuis zéro
-./check_hardlinks.sh --dry-run        # simulation complète, aucune écriture réelle
-./check_hardlinks.sh --help           # aide
+./check_hardlinks.sh                          # run normal (utilise les caches)
+./check_hardlinks.sh --use-no-cache            # ignore tous les caches, ré-analyse tout depuis zéro
+./check_hardlinks.sh --dry-run                 # simulation complète, aucune écriture réelle
+./check_hardlinks.sh --debug 2> debug.log      # journal de diagnostic détaillé sur stderr
+./check_hardlinks.sh --help                    # aide
 ```
 
 - `--use-no-cache` force un nouveau scan complet (hash, inodes, statut des torrents, inodes Arr) sans supprimer les caches existants — ils sont réécrits normalement en fin d'exécution pour les prochains runs.
 - `--dry-run` exécute toute l'analyse et la classification normalement, mais **aucune écriture réelle** n'a lieu : ni hardlink/chown sur le filesystem, ni tag ajouté/retiré dans qBittorrent. Force `AUTO_REPAIR=true` le temps du run pour prévisualiser les réparations qui seraient tentées (sans jamais les appliquer). Recommandé pour un premier run sur une nouvelle configuration.
+- `--debug` affiche sur stderr (préfixé `🐛 [DEBUG]`, n'affecte jamais la sortie normale sur stdout) : chaque requête API qBittorrent/Radarr/Sonarr avec son code HTTP, les traductions `PATH_MAP` appliquées, le diagnostic complet de chaque tentative de hardlink (device, inode, permissions), et les hashs comparés lors de la réparation (Phase 5). Combinable avec `--dry-run` pour investiguer un problème sans rien modifier.
 
 ## Les 10 phases
 
@@ -151,3 +153,4 @@ Tous les caches sont sauvegardés automatiquement en cas d'interruption (Ctrl+C)
 - **Torrent classé « orphan » alors qu'il est bien lié** : vérifiez `PATH_MAP` (traduction chemin conteneur → hôte) et que les torrents/la bibliothèque sont bien sur le même filesystem (nécessaire pour un hardlink).
 - **La Phase 5 ne répare presque rien** : normal si beaucoup d'orphelins ont déjà dépassé la durée de seed minimale de leur tracker — ils passent directement par la Phase 6, après une tentative de réparation en Phase 5.
 - **Un tag ne se retire jamais** : vérifiez qu'il figure bien dans `DELETE_TAGS`.
+- Pour investiguer n'importe lequel de ces cas, lancez avec `--dry-run --debug 2> debug.log` : classification et diagnostic complets, sans aucune écriture.
