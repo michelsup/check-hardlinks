@@ -97,10 +97,12 @@ tracker.autre.net=168
 ```bash
 ./check_hardlinks.sh                 # run normal (utilise les caches)
 ./check_hardlinks.sh --use-no-cache   # ignore tous les caches, ré-analyse tout depuis zéro
+./check_hardlinks.sh --dry-run        # simulation complète, aucune écriture réelle
 ./check_hardlinks.sh --help           # aide
 ```
 
-`--use-no-cache` force un nouveau scan complet (hash, inodes, statut des torrents, inodes Arr) sans supprimer les caches existants — ils sont réécrits normalement en fin d'exécution pour les prochains runs.
+- `--use-no-cache` force un nouveau scan complet (hash, inodes, statut des torrents, inodes Arr) sans supprimer les caches existants — ils sont réécrits normalement en fin d'exécution pour les prochains runs.
+- `--dry-run` exécute toute l'analyse et la classification normalement, mais **aucune écriture réelle** n'a lieu : ni hardlink/chown sur le filesystem, ni tag ajouté/retiré dans qBittorrent. Force `AUTO_REPAIR=true` le temps du run pour prévisualiser les réparations qui seraient tentées (sans jamais les appliquer). Recommandé pour un premier run sur une nouvelle configuration.
 
 ## Les 10 phases
 
@@ -141,7 +143,7 @@ Tous les caches sont sauvegardés automatiquement en cas d'interruption (Ctrl+C)
 
 - `config.conf` (mots de passe qBittorrent, clés API Radarr/Sonarr) et `tracker_secrets.conf` sont automatiquement passés en permissions `600` (lecture propriétaire uniquement).
 - Les réparations utilisent un hardlink **atomique** : le fichier orphelin n'est jamais supprimé avant que son remplaçant soit prêt et vérifié — en cas d'échec ou d'interruption, aucune perte de données.
-- `AUTO_REPAIR=true` et `SCAN_DISK_ORPHANS=true` déclenchent des opérations réelles sur le système de fichiers et sur vos instances qBittorrent (tags, hardlinks). Testez avec `AUTO_REPAIR=false` si vous voulez d'abord valider la classification sans rien modifier.
+- `AUTO_REPAIR=true` et `SCAN_DISK_ORPHANS=true` déclenchent des opérations réelles sur le système de fichiers et sur vos instances qBittorrent (tags, hardlinks). Utilisez `--dry-run` pour un premier run qui montre tout ce qui serait fait sans rien modifier.
 
 ## Dépannage
 

@@ -132,6 +132,7 @@ UNCACHED_TMP=""
 # OPTIONS DE LIGNE DE COMMANDE
 # -----------------------------------------------------------------------------
 NO_CACHE=false
+DRY_RUN=false
 
 print_usage() {
     cat <<EOF
@@ -142,6 +143,12 @@ Options :
                     des torrents, inodes Arr, liste qBittorrent) et force
                     une analyse complète depuis zéro. Les caches sont tout
                     de même réécrits en fin d'exécution pour les prochains runs.
+  --dry-run        Simulation : toute l'analyse et la classification
+                    s'exécutent normalement, mais aucune écriture réelle
+                    n'est effectuée — ni hardlink/chown sur le filesystem,
+                    ni tag ajouté/retiré dans qBittorrent. Force AUTO_REPAIR
+                    à true le temps du run pour prévisualiser les réparations
+                    qui seraient tentées, sans jamais les appliquer.
   -h, --help       Affiche cette aide et quitte.
 EOF
 }
@@ -149,6 +156,7 @@ EOF
 for arg in "$@"; do
     case "$arg" in
         --use-no-cache) NO_CACHE=true ;;
+        --dry-run) DRY_RUN=true ;;
         -h|--help) print_usage; exit 0 ;;
         *)
             printf '❌ Option inconnue : %s\n\n' "$arg" >&2
@@ -161,6 +169,12 @@ done
 if $NO_CACHE; then
     TORRENT_CACHE_DURATION=0
     ARR_CACHE_DURATION=0
+fi
+
+# En dry-run, on force AUTO_REPAIR pour que le script exécute (en simulation)
+# toute la logique de réparation et montre ce qui serait fait.
+if $DRY_RUN; then
+    AUTO_REPAIR=true
 fi
 
 # -----------------------------------------------------------------------------
@@ -214,7 +228,7 @@ trap cleanup_on_exit EXIT
 get_fs_id() { stat -c '%d' "$1" 2>/dev/null || echo "0"; }
 
 # Chown optionnel si les fichiers créés doivent appartenir à un utilisateur
-do_chown()  { $CHOWN_FILES && chown "$CHOWN_USER" "$1" 2>/dev/null || true; }
+do_chown()  { ! $DRY_RUN && $CHOWN_FILES && chown "$CHOWN_USER" "$1" 2>/dev/null || true; }
 
 # Sélection du meilleur outil de hachage disponible
 pick_hash_tool() {
@@ -597,6 +611,11 @@ qbit_get() {
 qbit_tag_single() {
     local instance="$1" hashes="$2" tag="$3"
     [ -z "$hashes" ] && return
+    if $DRY_RUN; then
+        printf '   🧪 [DRY-RUN] addTags [%s] « %s » → %d torrent(s) (non appliqué)\n' \
+            "$instance" "$tag" "$(printf '%s' "$hashes" | tr '|' '\n' | grep -c .)" >&2
+        return
+    fi
     local vars
     vars=$(qbit_vars "$instance") || return
     local url="${vars%%|*}"
@@ -627,6 +646,11 @@ qbit_tag_single() {
 qbit_remove_tags() {
     local instance="$1" hashes="$2" tags="$3"
     [ -z "$hashes" ] || [ -z "$tags" ] && return
+    if $DRY_RUN; then
+        printf '   🧪 [DRY-RUN] removeTags [%s] « %s » → %d torrent(s) (non appliqué)\n' \
+            "$instance" "$tags" "$(printf '%s' "$hashes" | tr '|' '\n' | grep -c .)" >&2
+        return
+    fi
     local vars
     vars=$(qbit_vars "$instance") || return
     local url="${vars%%|*}"
@@ -898,6 +922,13 @@ create_hardlink_atomic() {
     if [ ! -w "$parent" ]; then
         printf '       ❌ Répertoire parent non accessible en écriture : %s\n' "$parent"
         return 1
+    fi
+
+    # DRY-RUN : tout ce qui précède (existence, accès en écriture) a été
+    # vérifié réellement — seule l'écriture elle-même (ln/mv/cp) est simulée.
+    if $DRY_RUN; then
+        printf '       🧪 [DRY-RUN] Hardlink simulé, aucune écriture effectuée\n'
+        return 0
     fi
 
     local tmp_link="${target}.linktmp.$$"
@@ -1341,6 +1372,9 @@ main() {
     printf '║        qBittorrent Nettoyage — Hardlinks Intelligents       ║\n'
     printf '╚══════════════════════════════════════════════════════════════╝\n'
     printf '\n'
+    if $DRY_RUN; then
+        printf '🧪 MODE DRY-RUN — aucune écriture réelle (ni filesystem, ni qBittorrent)\n'
+    fi
     printf '📁 Configuration : %s\n' "$CONFIG_FILE"
     printf '📁 Cache         : %s\n' "$CACHE_DIR"
     printf '\n'
@@ -1891,7 +1925,17 @@ for t in data:
                         fi
                     done < <(find "$hpath" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \) -print0 2>/dev/null)
 
-                    if [ "$needs_repair" -gt 0 ] && [ "$fixed" -eq "$needs_repair" ]; then
+                    # En dry-run, create_hardlink_atomic n'écrit rien : $fixed
+                    # ne reflète qu'une simulation. On ne doit surtout pas
+                    # persister "linked"/"partial" sur cette base, sinon un
+                    # vrai run ultérieur croirait le torrent déjà réparé.
+                    if $DRY_RUN; then
+                        if [ "$needs_repair" -gt 0 ] && [ "$fixed" -eq "$needs_repair" ]; then
+                            printf '       🧪 [DRY-RUN] deviendrait entièrement Linked (non appliqué)\n'
+                        elif [ "$fixed" -gt 0 ]; then
+                            printf '       🧪 [DRY-RUN] %d/%d fichier(s) réparable(s) → resterait/deviendrait Partial (non appliqué)\n' "$fixed" "$needs_repair"
+                        fi
+                    elif [ "$needs_repair" -gt 0 ] && [ "$fixed" -eq "$needs_repair" ]; then
                         printf '       🔄 Torrent entièrement réparé → re-tagage Linked\n'
                         batch_remove "$instance" "$source_tag" "$hash"
                         batch_add "$instance" "$TAG_LINKED" "$hash"
@@ -2065,8 +2109,15 @@ for t in data:
     printf '║  🔗  Cross-linked           : %6d                      ║\n' "$torrent_cross_linked"
     printf '║  🟡  Partiel                : %6d                      ║\n' "$torrent_partial"
     printf '║  ⚠️   Orphelin              : %6d                      ║\n' "$torrent_orphan"
-    [ "$repaired_count" -gt 0 ] && printf '║  🔧  Fichiers réparés       : %6d                      ║\n' "$repaired_count"
+    if [ "$repaired_count" -gt 0 ]; then
+        if $DRY_RUN; then
+            printf '║  🧪  Fichiers réparables    : %6d (simulation)         ║\n' "$repaired_count"
+        else
+            printf '║  🔧  Fichiers réparés       : %6d                      ║\n' "$repaired_count"
+        fi
+    fi
     printf '╠══════════════════════════════════════════════════════════════╣\n'
+    $DRY_RUN && printf '║  🧪  DRY-RUN : aucune modification appliquée               ║\n'
     printf '║  ⏱️  Durée                  : %6d secondes            ║\n' "$duration"
     printf '╚══════════════════════════════════════════════════════════════╝\n'
 }
