@@ -72,36 +72,46 @@ mkdir -p "$CACHE_DIR"
 # VARIABLES GLOBALES
 # -----------------------------------------------------------------------------
 
+# CORRECTION : tous les tableaux associatifs ci-dessous sont initialisés
+# avec "=()" explicite, pas seulement "declare -A X". Un tableau associatif
+# déclaré mais jamais affecté au moins une fois (même à vide) reste dans un
+# état que bash considère "non lié" pour `${#X[@]}` sous `set -u` — même sur
+# des versions récentes (bash 5.x), ce n'est pas un bug corrigé avec le temps,
+# c'est le comportement voulu. Concrètement : avec --use-no-cache, les
+# fonctions load_*() qui font normalement ce premier "X=()" ne sont jamais
+# appelées, donc sans ce correctif `${#X[@]}` plantait en fin de run
+# ("X: unbound variable") dès qu'un cache restait vide sur tout le run.
+
 # Connexions qBittorrent
-declare -A QBIT_COOKIES
+declare -A QBIT_COOKIES=()
 
 # Caches disque
-declare -A HASH_CACHE
-declare -A INODE_STATUS_CACHE
-declare -A TORRENT_CACHE
+declare -A HASH_CACHE=()
+declare -A INODE_STATUS_CACHE=()
+declare -A TORRENT_CACHE=()
 
 # Métadonnées torrents
-declare -A TORRENT_NAMES
-declare -A TORRENT_INSTANCE
-declare -A TORRENT_SAVE_PATH
-declare -A TORRENT_HOST_PATH
+declare -A TORRENT_NAMES=()
+declare -A TORRENT_INSTANCE=()
+declare -A TORRENT_SAVE_PATH=()
+declare -A TORRENT_HOST_PATH=()
 # Tracker et temps de seed déjà présents dans /torrents/info (Phase 0),
 # utilisés en Phase 6 pour éviter un appel API séparé par torrent.
-declare -A TORRENT_TRACKER
-declare -A TORRENT_SEEDING_TIME
+declare -A TORRENT_TRACKER=()
+declare -A TORRENT_SEEDING_TIME=()
 
 # Inodes gérés par les Arr (Radarr/Sonarr)
-declare -A ARR_MANAGED_INODES
+declare -A ARR_MANAGED_INODES=()
 
-# Inodes présents dans CROSS_SEED_DIR
-declare -A CROSS_SEED_INODES
+# Inodes présents sous CROSS_SEED_DIR
+declare -A CROSS_SEED_INODES=()
 
 # Position des inodes (dans MEDIA_DIRS ou CROSS_SEED_DIR)
-declare -A INODE_IN_MEDIA
-declare -A INODE_IN_CROSS
+declare -A INODE_IN_MEDIA=()
+declare -A INODE_IN_CROSS=()
 
 # Batches de tags à appliquer par instance
-declare -A TAG_BATCHES
+declare -A TAG_BATCHES=()
 
 # Initialisation des batches pour éviter les variables unbound
 for inst in "${INSTANCES[@]}"; do
@@ -1175,7 +1185,7 @@ try_repair_file() {
     # Split : noms similaires en priorité, fallback sinon
     # CORRECTION : tableau associatif pour déduplication rapide
     local -a priority=() fallback=()
-    declare -A seen_inodes
+    declare -A seen_inodes=()
     local candidate c_inode orphan_inode
     orphan_inode=$(stat -c '%i' "$orphan_file" 2>/dev/null || echo "0")
     for candidate in "${all_candidates[@]}"; do
@@ -1336,8 +1346,7 @@ try_repair_file() {
 TRACKER_SECRETS_FILE="${SCRIPT_DIR}/cleanup/tracker_secrets.conf"
 
 load_tracker_secrets() {
-    declare -gA TRACKER_MIN_SEED
-    TRACKER_MIN_SEED=()
+    declare -gA TRACKER_MIN_SEED=()
     [ -f "$TRACKER_SECRETS_FILE" ] || return
     local domain hours
     while IFS='=' read -r domain hours; do
@@ -1502,7 +1511,7 @@ phase7_scan_disk_orphans() {
     } > "$disk_orphan_log"
 
     # Indexation rapide : inodes déjà connus par les torrents
-    declare -A TORRENT_INODE_HASH
+    declare -A TORRENT_INODE_HASH=()
     local hash hpath f finode
     for hash in "${!TORRENT_NAMES[@]}"; do
         hpath="${TORRENT_HOST_PATH[$hash]:-}"
