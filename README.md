@@ -125,6 +125,8 @@ tracker.autre.net=168
 
 Un torrent `orphan` ou `partial` réparé en Phase 5 devient `linked` s'il est entièrement corrigé, ou reste `partial` si seulement une partie de ses fichiers a pu être réparée. Un torrent `partial` n'est **jamais** proposé à la suppression (Phase 6) : il contient de vrais fichiers non dupliqués ailleurs.
 
+**Performance de la Phase 5** : avant de comparer deux fichiers de même taille par hash complet (coûteux sur des fichiers vidéo de plusieurs Go), un hash rapide par échantillonnage (début/milieu/fin, ~3 Mo au lieu de tout le fichier) sert de pré-filtre. Le hash complet n'est calculé que pour confirmer une correspondance déjà trouvée par échantillonnage — jamais pour rejeter un candidat, et jamais pour l'orphelin lui-même s'il ne trouve finalement aucune correspondance.
+
 ## Tags appliqués
 
 Les tags sont entièrement nettoyés puis réappliqués à chaque run (Phases 8-9), donc toujours à jour par rapport au dernier scan. Personnalisables via `TAG_*` dans `config.conf`.

@@ -453,6 +453,45 @@ file_hash() {
     return 0
 }
 
+# CORRECTION PERF : pré-filtre avant un hash complet. Hash "rapide" d'un
+# fichier basé sur 3 échantillons (début / milieu / fin, ~1 Mo chacun) au
+# lieu de lire tout le fichier. Utilisé par try_repair_file pour écarter en
+# quelques millisecondes les candidats de même taille mais de contenu
+# différent, sans lire des Go de données par candidat testé — le hash
+# complet (file_hash, mis en cache) n'est ensuite recalculé que pour
+# confirmer une correspondance déjà trouvée par échantillonnage, jamais pour
+# rejeter un candidat. Deux fichiers identiques ont forcément les mêmes
+# échantillons (aucun faux négatif possible) ; un éventuel faux positif est
+# rattrapé par la confirmation en hash complet avant toute action.
+# Pas de cache disque dédié : déjà assez rapide pour être recalculé à chaque
+# appel (contrairement au hash complet, qui lui reste mis en cache).
+QUICK_HASH_SAMPLE_SIZE=$((1024 * 1024))
+
+quick_file_hash() {
+    local filepath="$1" fsize="$2"
+    [ -z "$HASH_CMD" ] && return 1
+
+    # Fichier assez petit pour que l'échantillonnage n'apporte rien : autant
+    # faire directement un hash complet (et profiter de son cache).
+    if [ "$fsize" -le "$((QUICK_HASH_SAMPLE_SIZE * 3))" ]; then
+        file_hash "$filepath"
+        return $?
+    fi
+
+    local mid_skip=$(( (fsize / 2) / QUICK_HASH_SAMPLE_SIZE ))
+    local end_skip=$(( (fsize - QUICK_HASH_SAMPLE_SIZE) / QUICK_HASH_SAMPLE_SIZE ))
+
+    local hash
+    hash=$({
+        dd if="$filepath" bs="$QUICK_HASH_SAMPLE_SIZE" count=1 skip=0 2>/dev/null
+        dd if="$filepath" bs="$QUICK_HASH_SAMPLE_SIZE" count=1 skip="$mid_skip" 2>/dev/null
+        dd if="$filepath" bs="$QUICK_HASH_SAMPLE_SIZE" count=1 skip="$end_skip" 2>/dev/null
+    } | "$HASH_CMD" 2>/dev/null | cut -d' ' -f1)
+    [ -z "$hash" ] && return 1
+    printf '%s' "$hash"
+    return 0
+}
+
 # --- Cache d'inodes (position : media/cross/inconnu) ---
 load_inode_cache() {
     INODE_STATUS_CACHE=()
@@ -1156,26 +1195,52 @@ try_repair_file() {
 
     printf '       📊 %d nom similaire + %d autre(s)\n' "${#priority[@]}" "${#fallback[@]}"
 
-    # Hachage du fichier orphelin
-    printf '       ⏳ Hachage... '
-    local fhash
-    fhash=$(file_hash "$orphan_file")
-    [ -z "$fhash" ] && { printf '❌\n'; return 1; }
-    printf '✓ %s...\n' "${fhash:0:8}"
-    debug_log "try_repair_file : hash orphelin ($HASH_CMD) = $fhash"
+    # Hachage rapide (échantillonné) du fichier orphelin : pré-filtre avant
+    # le hash complet, qui n'est calculé pour l'orphelin lui-même qu'au
+    # moment d'une confirmation (voir plus bas), pas systématiquement — si
+    # aucun candidat ne correspond même par échantillonnage, il ne sert à
+    # rien de lire tout le fichier orphelin.
+    printf '       ⏳ Hachage rapide... '
+    local fqhash
+    fqhash=$(quick_file_hash "$orphan_file" "$fsize")
+    [ -z "$fqhash" ] && { printf '❌\n'; return 1; }
+    printf '✓ %s...\n' "${fqhash:0:8}"
+    debug_log "try_repair_file : hash rapide orphelin = $fqhash"
+
+    # Hash complet de l'orphelin : calculé une seule fois, seulement à la
+    # première confirmation nécessaire (voir les deux boucles ci-dessous).
+    local fhash=""
 
     # Test priorité (noms similaires)
-    local checked=0 cname chash
+    local checked=0 cname cqhash chash
     for candidate in "${priority[@]}"; do
         checked=$((checked + 1))
         cname=$(basename "$candidate")
         printf '       [%d/%d] ⏳ %s... ' "$checked" "${#priority[@]}" "${cname:0:50}"
+        cqhash=$(quick_file_hash "$candidate" "$fsize")
+        if [ -z "$cqhash" ]; then
+            printf '❌\n'
+            continue
+        fi
+        debug_log "try_repair_file : hash rapide candidat $candidate = $cqhash"
+        if [ "$cqhash" != "$fqhash" ]; then
+            printf '✗\n'
+            continue
+        fi
+        # Pré-filtre passé : confirmation par hash complet avant toute action.
+        if [ -z "$fhash" ]; then
+            fhash=$(file_hash "$orphan_file")
+            if [ -z "$fhash" ]; then
+                printf '❌ (hash complet orphelin impossible)\n'
+                continue
+            fi
+            debug_log "try_repair_file : hash complet orphelin ($HASH_CMD) = $fhash"
+        fi
         chash=$(file_hash "$candidate")
         if [ -z "$chash" ]; then
             printf '❌\n'
             continue
         fi
-        debug_log "try_repair_file : hash candidat $candidate = $chash"
         if [ "$chash" = "$fhash" ]; then
             printf '✅ CORRESPONDANCE !\n'
             printf '       🔧 Hardlink...\n'
@@ -1189,7 +1254,7 @@ try_repair_file() {
                 return 1
             fi
         fi
-        printf '✗\n'
+        printf '✗ (faux positif hash rapide)\n'
     done
 
     # Test fallback (noms différents, même taille)
@@ -1203,12 +1268,29 @@ try_repair_file() {
             checked_fb=$((checked_fb + 1))
             cname=$(basename "$candidate")
             printf '       [%d/%d] ⏳ %s... ' "$checked_fb" "$total_fb" "${cname:0:50}"
+            cqhash=$(quick_file_hash "$candidate" "$fsize")
+            if [ -z "$cqhash" ]; then
+                printf '❌\n'
+                continue
+            fi
+            debug_log "try_repair_file : hash rapide candidat $candidate = $cqhash"
+            if [ "$cqhash" != "$fqhash" ]; then
+                printf '✗\n'
+                continue
+            fi
+            if [ -z "$fhash" ]; then
+                fhash=$(file_hash "$orphan_file")
+                if [ -z "$fhash" ]; then
+                    printf '❌ (hash complet orphelin impossible)\n'
+                    continue
+                fi
+                debug_log "try_repair_file : hash complet orphelin ($HASH_CMD) = $fhash"
+            fi
             chash=$(file_hash "$candidate")
             if [ -z "$chash" ]; then
                 printf '❌\n'
                 continue
             fi
-            debug_log "try_repair_file : hash candidat $candidate = $chash"
             if [ "$chash" = "$fhash" ]; then
                 printf '✅ CORRESPONDANCE (nom différent) !\n'
                 printf '       🔧 Hardlink...\n'
@@ -1222,7 +1304,7 @@ try_repair_file() {
                     return 1
                 fi
             fi
-            printf '✗\n'
+            printf '✗ (faux positif hash rapide)\n'
         done
     fi
 
