@@ -403,6 +403,29 @@ for line in sys.stdin:
 # PATH_MAP fait ce pont de manière bidirectionnelle.
 # CORRECTION : parcours trié par préfixe le plus long d'abord pour éviter
 # qu'un préfixe court masque un préfixe plus spécifique.
+# Le tri est calculé une seule fois et mis en cache : PATH_MAP ne change
+# jamais après le chargement de la config, alors que translate_path() est
+# appelée des milliers de fois (une fois par torrent, par fichier, ...).
+# Recalculer le tri (awk|sort|cut, donc 3 forks) à chaque appel faisait
+# gonfler le temps de chargement du cache torrents de manière très visible.
+PATH_MAP_SORTED_PREFIXES=()
+PATH_MAP_SORTED_READY=false
+
+_init_path_map_sorted_prefixes() {
+    $PATH_MAP_SORTED_READY && return
+    PATH_MAP_SORTED_READY=true
+    local prefix
+    for prefix in "${!PATH_MAP[@]}"; do
+        PATH_MAP_SORTED_PREFIXES+=("$prefix")
+    done
+    [ "${#PATH_MAP_SORTED_PREFIXES[@]}" -eq 0 ] && return
+    local sorted=() line
+    while IFS= read -r line; do
+        sorted+=("$line")
+    done < <(printf '%s\n' "${PATH_MAP_SORTED_PREFIXES[@]}" | awk '{print length, $0}' | sort -nr | cut -d' ' -f2-)
+    PATH_MAP_SORTED_PREFIXES=("${sorted[@]}")
+}
+
 translate_path() {
     local container_path="$1"
 
@@ -412,9 +435,11 @@ translate_path() {
         return
     fi
 
+    _init_path_map_sorted_prefixes
+
     local host_path="$container_path"
     local container_prefix matched=""
-    for container_prefix in $(printf '%s\n' "${!PATH_MAP[@]}" | awk '{print length, $0}' | sort -nr | cut -d' ' -f2-); do
+    for container_prefix in "${PATH_MAP_SORTED_PREFIXES[@]}"; do
         if [[ "$container_path" == "$container_prefix"/* ]]; then
             local suffix="${container_path#$container_prefix/}"
             host_path="${PATH_MAP[$container_prefix]%/}/${suffix}"

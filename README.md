@@ -131,6 +131,8 @@ Un torrent `orphan` ou `partial` réparé en Phase 5 devient `linked` s'il est e
 
 **Performance des parcours de fichiers** : parcourir un dossier torrent ou la bibliothèque avec `find` puis lire l'inode de chaque fichier avec un `stat` externe coûte un fork+exec par fichier — sur une grosse bibliothèque, ça representait des milliers de processus juste pour lire des métadonnées. Ces parcours (Phases 2 à 5, scan de la bibliothèque, indexation Radarr/Sonarr) passent maintenant par un seul processus Python par appel (`os.walk` + `os.lstat`), qui renvoie directement inode/taille/chemin.
 
+**Performance du chargement du cache torrents** : la traduction de chemin (`translate_path`, Docker → hôte via `PATH_MAP`) refaisait un tri complet des préfixes (`awk`+`sort`+`cut`, donc 3 process externes) à **chaque appel**, alors qu'elle est appelée une fois par torrent au chargement du cache. Sur une grosse liste de torrents, ça pouvait à lui seul représenter l'essentiel du temps de démarrage. Le tri est maintenant calculé une seule fois et mis en cache, `PATH_MAP` ne changeant jamais en cours de run.
+
 ## Tags appliqués
 
 Les tags sont entièrement nettoyés puis réappliqués à chaque run (Phases 8-9), donc toujours à jour par rapport au dernier scan. Personnalisables via `TAG_*` dans `config.conf`.
