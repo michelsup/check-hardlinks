@@ -306,6 +306,97 @@ pick_hash_tool() {
 }
 
 # -----------------------------------------------------------------------------
+# PARCOURS DE RÉPERTOIRES (Python, un seul processus au lieu de find+stat)
+# -----------------------------------------------------------------------------
+# CORRECTION PERF : le script appelait auparavant `find` puis un `stat`
+# externe PAR FICHIER trouvé pour récupérer son inode — sur une bibliothèque
+# de plusieurs milliers de fichiers, ça fait des milliers de fork+exec rien
+# que pour lire des métadonnées (souvent déjà en cache disque/ARR ZFS, donc
+# le vrai coût est le spawn de processus, pas l'accès disque lui-même). Ces
+# trois fonctions font le parcours ET le stat en un seul processus Python
+# (os.walk + os.lstat), et retournent des lignes "inode<TAB>taille<TAB>chemin".
+#
+# Limite assumée : le chemin (dernier champ) peut contenir des tabulations
+# sans casser le parsing (`read` avec IFS=tab absorbe le reste de la ligne
+# dans la dernière variable), mais PAS un retour à la ligne — cas
+# infinitésimal pour des noms de fichiers média réels, comme le reste du
+# script (caches internes déjà en TSV/pipe-delimited).
+
+# Extensions vidéo reconnues, utilisées à plusieurs endroits (Phases 2-5,
+# scan des médias/cross-seed) — centralisées ici pour éviter la répétition.
+MEDIA_EXTENSIONS_CSV="mkv,mp4,avi,ts,m4v,mov,wmv,flv,webm"
+
+# Parcourt un ou plusieurs répertoires, filtré par extensions (CSV sans point,
+# insensible à la casse) ou sans filtre si la liste est vide. Seuls les
+# fichiers réguliers sont retournés (comme `find -type f`, les liens
+# symboliques sont exclus, pas suivis lors du parcours).
+scan_files() {
+    local exts_csv="$1"; shift
+    [ "$#" -eq 0 ] && return 0
+    python3 -c "
+import os, stat, sys
+
+exts_csv = sys.argv[1]
+exts = {'.' + e.strip().lower() for e in exts_csv.split(',') if e.strip()} if exts_csv else None
+for root in sys.argv[2:]:
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            if exts is not None and os.path.splitext(name)[1].lower() not in exts:
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            print(f'{st.st_ino}\t{st.st_size}\t{full}')
+" "$exts_csv" "$@" 2>/dev/null
+}
+
+# Variante filtrée par taille exacte (octets), sans filtre d'extension —
+# utilisée par try_repair_file pour chercher des candidats de même taille
+# qu'un fichier orphelin dans toute la bibliothèque.
+scan_files_by_size() {
+    local size="$1"; shift
+    [ "$#" -eq 0 ] && return 0
+    python3 -c "
+import os, stat, sys
+
+target_size = int(sys.argv[1])
+for root in sys.argv[2:]:
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size != target_size:
+                continue
+            print(f'{st.st_ino}\t{st.st_size}\t{full}')
+" "$size" "$@" 2>/dev/null
+}
+
+# Stat en lot une liste de chemins (un par ligne sur stdin, pour éviter toute
+# limite ARG_MAX sur de grosses listes) : retourne "inode<TAB>chemin" pour
+# chaque chemin qui existe encore.
+stat_paths_bulk() {
+    python3 -c "
+import os, sys
+for line in sys.stdin:
+    path = line.rstrip('\n')
+    if not path:
+        continue
+    try:
+        st = os.stat(path)
+    except OSError:
+        continue
+    print(f'{st.st_ino}\t{path}')
+" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
 # TRANSLATION DE CHEMINS (Docker → Hôte)
 # -----------------------------------------------------------------------------
 # Les containers qBittorrent voient /data/completed, l'hôte voit /mnt/tank/...
@@ -1043,20 +1134,27 @@ except: pass
         done
     fi
 
-    # Traduction des chemins et indexation par inode
+    # Traduction des chemins (translate_path reste en bash, dépend de
+    # PATH_MAP), puis stat en lot de tous les chemins traduits d'un coup
+    # (CORRECTION PERF : un seul processus Python au lieu d'un `stat`
+    # externe par fichier Arr — potentiellement des milliers).
     local count=0
-    local raw_path
+    local raw_path host_path
+    local -a host_paths=()
     while IFS= read -r raw_path; do
         [ -z "$raw_path" ] && continue
-        local host_path
         host_path=$(translate_path "$raw_path")
         [ ! -f "$host_path" ] && continue
-        local inode
-        inode=$(stat -c '%i' "$host_path" 2>/dev/null || echo "0")
-        [ "$inode" = "0" ] && continue
-        ARR_MANAGED_INODES["$inode"]="$host_path"
-        count=$((count + 1))
+        host_paths+=("$host_path")
     done < "$cache_raw"
+
+    if [ "${#host_paths[@]}" -gt 0 ]; then
+        local inode hpath_stated
+        while IFS=$'\t' read -r inode hpath_stated; do
+            ARR_MANAGED_INODES["$inode"]="$hpath_stated"
+            count=$((count + 1))
+        done < <(printf '%s\n' "${host_paths[@]}" | stat_paths_bulk)
+    fi
 
     printf '%d fichier(s) → %d inode(s)\n' "$count" "${#ARR_MANAGED_INODES[@]}"
 }
@@ -1162,8 +1260,10 @@ try_repair_file() {
     printf '       📄 %s (%d octets)\n' "$fname" "$fsize"
     [ -n "$norm_orphan" ] && printf '       🏷️  « %s »\n' "$norm_orphan"
 
-    # Candidats : même taille, même filesystem
-    local -a all_candidates=()
+    # Candidats : même taille, même filesystem. scan_files_by_size renvoie
+    # déjà l'inode de chaque candidat (CORRECTION PERF : un seul processus
+    # Python par MEDIA_DIRS au lieu d'un `find` + un `stat` par candidat).
+    local -a all_candidates=() all_candidate_inodes=()
     local media_dir media_dev
     for media_dir in "${MEDIA_DIRS[@]}"; do
         [ ! -d "$media_dir" ] && continue
@@ -1172,10 +1272,11 @@ try_repair_file() {
             debug_log "try_repair_file : $media_dir ignoré (device $media_dev ≠ device orphelin $orphan_dev, hardlink impossible)"
             continue
         fi
-        local c
-        while IFS= read -r -d '' c; do
+        local c_inode2 c_size2 c
+        while IFS=$'\t' read -r c_inode2 c_size2 c; do
             all_candidates+=("$c")
-        done < <(find "$media_dir" -type f -size "${fsize}c" -print0 2>/dev/null)
+            all_candidate_inodes+=("$c_inode2")
+        done < <(scan_files_by_size "$fsize" "$media_dir")
     done
 
     local total_candidates=${#all_candidates[@]}
@@ -1186,11 +1287,12 @@ try_repair_file() {
     # CORRECTION : tableau associatif pour déduplication rapide
     local -a priority=() fallback=()
     declare -A seen_inodes=()
-    local candidate c_inode orphan_inode
+    local candidate c_inode orphan_inode cand_idx
     orphan_inode=$(stat -c '%i' "$orphan_file" 2>/dev/null || echo "0")
-    for candidate in "${all_candidates[@]}"; do
+    for cand_idx in "${!all_candidates[@]}"; do
+        candidate="${all_candidates[$cand_idx]}"
+        c_inode="${all_candidate_inodes[$cand_idx]}"
         [ "$candidate" = "$orphan_file" ] && continue
-        c_inode=$(stat -c '%i' "$candidate" 2>/dev/null || echo "0")
 
         # Déjà hardlinké (même inode que le "candidat") : rien à faire,
         # ce n'est pas vraiment un orphelin. Évite un ln/mv inutile qui
@@ -1510,17 +1612,18 @@ phase7_scan_disk_orphans() {
         printf '# inode\ttaille\tchemin\n'
     } > "$disk_orphan_log"
 
-    # Indexation rapide : inodes déjà connus par les torrents
+    # Indexation rapide : inodes déjà connus par les torrents (tous les
+    # fichiers, pas seulement les extensions média, pour ne pas rater un
+    # fichier "orphelin de disque" à tort à cause d'un filtre trop strict).
     declare -A TORRENT_INODE_HASH=()
     local hash hpath f finode
     for hash in "${!TORRENT_NAMES[@]}"; do
         hpath="${TORRENT_HOST_PATH[$hash]:-}"
         [ ! -e "$hpath" ] && continue
-        while IFS= read -r -d '' f; do
-            finode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
+        while IFS=$'\t' read -r finode fsize2 f; do
             [ "$finode" = "0" ] && continue
             TORRENT_INODE_HASH["$finode"]="$hash"
-        done < <(find "$hpath" -type f -print0 2>/dev/null)
+        done < <(scan_files "" "$hpath")
     done
 
     # Boucle EXPLICITE par index
@@ -1540,31 +1643,16 @@ phase7_scan_disk_orphans() {
 
         printf '   Scan [%d/%d] : %s ...\n' "$dir_num" "$dir_total" "$media_dir"
 
-        local -a find_args=()
-        find_args+=("$media_dir")
-        find_args+=("-type" "f")
-
+        # DISK_ORPHAN_EXTENSIONS est optionnel (vide = pas de filtre) ;
+        # jointure en CSV pour scan_files.
+        local ext_csv=""
         if [ "${#DISK_ORPHAN_EXTENSIONS[@]}" -gt 0 ] 2>/dev/null; then
-            local ext_idx ext
-            for ext_idx in "${!DISK_ORPHAN_EXTENSIONS[@]}"; do
-                ext="${DISK_ORPHAN_EXTENSIONS[$ext_idx]}"
-                if [ "$ext_idx" -eq 0 ]; then
-                    find_args+=("(" "-iname" "*.${ext}")
-                else
-                    find_args+=("-o" "-iname" "*.${ext}")
-                fi
-            done
-            find_args+=(")")
+            ext_csv=$(IFS=','; echo "${DISK_ORPHAN_EXTENSIONS[*]}")
         fi
 
-        find_args+=("-print0")
-
         local fpath fsize
-        while IFS= read -r -d '' fpath; do
-            finode=$(stat -c '%i' "$fpath" 2>/dev/null || echo "0")
+        while IFS=$'\t' read -r finode fsize fpath; do
             [ "$finode" = "0" ] && continue
-
-            fsize=$(stat -c '%s' "$fpath" 2>/dev/null || echo "0")
             [ "$fsize" -lt "$min_size" ] && continue
 
             [ -n "${ARR_MANAGED_INODES[$finode]:-}" ] && continue
@@ -1575,7 +1663,7 @@ phase7_scan_disk_orphans() {
             printf '%s\t%s\t%s\n' "$finode" "$fsize" "$fpath" >> "$disk_orphan_log"
             printf '      ⚠️  %s\n' "$fpath"
 
-        done < <(find "${find_args[@]}" 2>/dev/null)
+        done < <(scan_files "$ext_csv" "$media_dir")
 
         printf '   ✓ [%d/%d] terminé\n' "$dir_num" "$dir_total"
     done
@@ -1846,9 +1934,8 @@ for t in data:
         all_arr=true
         any_file=false
         any_cross=false
-        while IFS= read -r -d '' f; do
+        while IFS=$'\t' read -r finode fsize2 f; do
             any_file=true
-            finode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
             if [ -n "${ARR_MANAGED_INODES[$finode]:-}" ]; then
                 found_arr=true
                 INODE_IN_MEDIA["$finode"]=true
@@ -1862,7 +1949,7 @@ for t in data:
             else
                 INODE_IN_CROSS["$finode"]=false
             fi
-        done < <(find "$hpath" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \) -print0 2>/dev/null)
+        done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
 
         if $any_file && $found_arr && $all_arr; then
             if $any_cross; then
@@ -1919,11 +2006,10 @@ for t in data:
         [ -z "$hpath" ] && continue
         [ ! -e "$hpath" ] && continue
 
-        while IFS= read -r -d '' f; do
-            finode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
+        while IFS=$'\t' read -r finode fsize2 f; do
             [ "$finode" = "0" ] && continue
             printf '%s|%s|%s\n' "$finode" "$hash" "$f" >> "$all_files_tmp"
-        done < <(find "$hpath" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \) -print0 2>/dev/null)
+        done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
         unprocessed=$((unprocessed + 1))
     done
 
@@ -2071,15 +2157,14 @@ for t in data:
         all_in_media=true
         any_cross=false
         file_count=0
-        while IFS= read -r -d '' f; do
+        while IFS=$'\t' read -r finode fsize2 f; do
             file_count=$((file_count + 1))
-            finode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
             if [ "${INODE_IN_MEDIA[$finode]:-false}" = true ]; then
                 [ "${INODE_IN_CROSS[$finode]:-false}" = true ] && any_cross=true
             else
                 all_in_media=false
             fi
-        done < <(find "$hpath" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \) -print0 2>/dev/null)
+        done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
 
         # CORRECTION : torrent sans fichier média
         if [ "$file_count" -eq 0 ]; then
@@ -2178,15 +2263,14 @@ for t in data:
                     # seulement "partial" (au lieu de tout-ou-rien comme avant,
                     # ce qui ratait les torrents partiellement réparés).
                     local needs_repair=0 fixed=0
-                    while IFS= read -r -d '' f; do
-                        finode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
+                    while IFS=$'\t' read -r finode fsize2 f; do
                         [ "${INODE_IN_MEDIA[$finode]:-false}" = true ] && continue
                         needs_repair=$((needs_repair + 1))
                         if try_repair_file "$f"; then
                             repaired_count=$((repaired_count + 1))
                             fixed=$((fixed + 1))
                         fi
-                    done < <(find "$hpath" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \) -print0 2>/dev/null)
+                    done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
 
                     # En dry-run, create_hardlink_atomic n'écrit rien : $fixed
                     # ne reflète qu'une simulation. On ne doit surtout pas
@@ -2393,19 +2477,14 @@ for t in data:
 # =============================================================================
 
 scan_media_dirs_for_inodes() {
-    local media_path f minode
+    local media_path f minode fsize2
     for media_path in "${MEDIA_DIRS[@]}"; do
         [ -d "$media_path" ] || continue
-        while IFS= read -r -d '' f; do
-            minode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
+        while IFS=$'\t' read -r minode fsize2 f; do
             [ "$minode" = "0" ] && continue
             [ -n "${ARR_MANAGED_INODES[$minode]:-}" ] && continue
             ARR_MANAGED_INODES["$minode"]="$f"
-        done < <(find "$media_path" -type f \( \
-            -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o \
-            -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o \
-            -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \
-        \) -print0 2>/dev/null)
+        done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$media_path")
     done
     save_arr_inodes_bulk
 }
@@ -2416,16 +2495,11 @@ scan_cross_seed_dir_for_inodes() {
     CROSS_SEED_INODES=()
     [ -z "$CROSS_SEED_DIR" ] && return
     [ -d "$CROSS_SEED_DIR" ] || return
-    local f cinode
-    while IFS= read -r -d '' f; do
-        cinode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
+    local f cinode fsize2
+    while IFS=$'\t' read -r cinode fsize2 f; do
         [ "$cinode" = "0" ] && continue
         CROSS_SEED_INODES["$cinode"]="$f"
-    done < <(find "$CROSS_SEED_DIR" -type f \( \
-        -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o \
-        -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o \
-        -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \
-    \) -print0 2>/dev/null)
+    done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$CROSS_SEED_DIR")
 }
 
 main "$@"

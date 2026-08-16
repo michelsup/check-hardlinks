@@ -129,6 +129,8 @@ Un torrent `orphan` ou `partial` réparé en Phase 5 devient `linked` s'il est e
 
 **Performance de la Phase 5** : par défaut, deux fichiers de même taille sont comparés par hash rapide par échantillonnage (début/milieu/fin, ~3 Mo au lieu de tout le fichier vidéo) — un candidat qui correspond est hardlinké directement, sans hash complet. Utilisez `--full-hash` pour exiger en plus une confirmation par hash complet avant chaque hardlink (plus lent, plus rigoureux).
 
+**Performance des parcours de fichiers** : parcourir un dossier torrent ou la bibliothèque avec `find` puis lire l'inode de chaque fichier avec un `stat` externe coûte un fork+exec par fichier — sur une grosse bibliothèque, ça representait des milliers de processus juste pour lire des métadonnées. Ces parcours (Phases 2 à 5, scan de la bibliothèque, indexation Radarr/Sonarr) passent maintenant par un seul processus Python par appel (`os.walk` + `os.lstat`), qui renvoie directement inode/taille/chemin.
+
 ## Tags appliqués
 
 Les tags sont entièrement nettoyés puis réappliqués à chaque run (Phases 8-9), donc toujours à jour par rapport au dernier scan. Personnalisables via `TAG_*` dans `config.conf`.
