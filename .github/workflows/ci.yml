@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n check_hardlinks.sh
+
+      - name: ShellCheck (rapport, non bloquant)
+        run: shellcheck -x check_hardlinks.sh || true

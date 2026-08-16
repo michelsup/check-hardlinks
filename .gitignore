@@ -9,3 +9,9 @@ cleanup/tracker_secrets.conf
 cleanup/*.txt
 cleanup/disk_orphans.log
 disk_orphans.log
+
+# Verrou anti-exécutions concurrentes
+cleanup/*.lock
+
+# Sortie de --debug redirigée
+debug.log

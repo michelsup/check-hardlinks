@@ -86,7 +86,7 @@ declare -A TORRENT_INSTANCE
 declare -A TORRENT_SAVE_PATH
 declare -A TORRENT_HOST_PATH
 # Tracker et temps de seed déjà présents dans /torrents/info (Phase 0),
-# utilisés en Phase 4.5 pour éviter un appel API séparé par torrent.
+# utilisés en Phase 6 pour éviter un appel API séparé par torrent.
 declare -A TORRENT_TRACKER
 declare -A TORRENT_SEEDING_TIME
 
@@ -194,6 +194,26 @@ if $DRY_RUN; then
 fi
 
 # -----------------------------------------------------------------------------
+# VERROU (empêche deux exécutions simultanées)
+# -----------------------------------------------------------------------------
+# Deux runs en parallèle (cron qui se chevauche, lancement manuel pendant un
+# cron, etc.) peuvent se marcher dessus sur les caches, les tags qBittorrent
+# et les réparations par hardlink. On prend un verrou non bloquant : si une
+# autre instance tourne déjà, on quitte immédiatement plutôt que d'attendre
+# ou de risquer une exécution concurrente.
+if ! command -v flock &>/dev/null; then
+    echo "❌ flock requis (paquet util-linux)."
+    exit 1
+fi
+LOCK_FILE="${CACHE_DIR}/check_hardlinks.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "❌ Une autre instance de check_hardlinks.sh tourne déjà (verrou : $LOCK_FILE)."
+    echo "   Si vous êtes certain qu'aucune autre instance ne tourne, supprimez ce fichier."
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
 # SIGNAL HANDLER
 # -----------------------------------------------------------------------------
 # CORRECTION : le trap EXIT et le trap SIGINT/SIGTERM/SIGHUP partageaient la
@@ -242,6 +262,15 @@ trap cleanup_on_exit EXIT
 
 # ID du filesystem (device) pour vérifier qu'un hardlink est possible
 get_fs_id() { stat -c '%d' "$1" 2>/dev/null || echo "0"; }
+
+# Échappe une valeur pour l'insérer dans un fichier de config curl (-K -),
+# utilisé pour passer mots de passe / clés API à curl via stdin plutôt qu'en
+# argument de ligne de commande — un argument de ligne de commande est
+# visible en clair (le temps de l'appel) par tout autre utilisateur local via
+# `ps aux` ou `/proc/<pid>/cmdline`.
+_curl_cfg_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
 
 # Chown optionnel si les fichiers créés doivent appartenir à un utilisateur
 do_chown()  { ! $DRY_RUN && $CHOWN_FILES && chown "$CHOWN_USER" "$1" 2>/dev/null || true; }
@@ -503,7 +532,7 @@ load_torrent_list_cache() {
     [ "$age" -ge "$TORRENT_CACHE_DURATION" ] && return 1
 
     # tracker/seeding_time peuvent être absents (anciens fichiers de cache) :
-    # ils resteront vides, ce qui déclenche le repli sur l'appel API en Phase 4.5.
+    # ils resteront vides, ce qui déclenche le repli sur l'appel API en Phase 6.
     local hash instance name save_path size tracker seeding_time translated hpath
     while IFS='|' read -r hash instance name save_path size tracker seeding_time; do
         [ -z "$hash" ] && continue
@@ -594,12 +623,15 @@ qbit_login() {
     IFS='|' read -r url user pass <<< "$vars"
     debug_log "qbit_login [$instance] POST ${url}/api/v2/auth/login (user=${user})"
     local cookie
-    # CORRECTION : credentials URL-encodés
-    cookie=$(curl -s -c - \
-        --data-urlencode "username=${user}" \
-        --data-urlencode "password=${pass}" \
-        --connect-timeout 5 --max-time 10 \
-        "${url}/api/v2/auth/login" 2>/dev/null | awk '/SID/ {print $NF}')
+    # CORRECTION : credentials URL-encodés, passés via -K - (stdin) plutôt
+    # qu'en argument de ligne de commande pour ne pas exposer le mot de
+    # passe dans `ps aux` le temps de l'appel.
+    cookie=$(curl -s -c - -K - --connect-timeout 5 --max-time 10 \
+        "${url}/api/v2/auth/login" <<CURLCFG 2>/dev/null | awk '/SID/ {print $NF}'
+data-urlencode = "username=$(_curl_cfg_escape "$user")"
+data-urlencode = "password=$(_curl_cfg_escape "$pass")"
+CURLCFG
+)
     if [ -z "$cookie" ]; then
         debug_log "qbit_login [$instance] échec : aucun cookie SID obtenu"
         return 1
@@ -612,7 +644,7 @@ qbit_login() {
 # CORRECTION PERF : reconnexion réactive (seulement si la session a
 # vraiment expiré, HTTP 401/403) au lieu d'un ping système avant CHAQUE
 # appel — ça doublait le nombre de requêtes HTTP de tout le script
-# (particulièrement sensible en Phase 4.5, un appel par torrent orphelin).
+# (particulièrement sensible en Phase 6, un appel par torrent orphelin).
 qbit_get() {
     local instance="$1" path="$2"
     local vars
@@ -801,6 +833,37 @@ remove_tags_batches() {
 # API RADARR / SONARR
 # =============================================================================
 
+# Récupère les fichiers d'UNE série Sonarr et les écrit dans
+# "<outdir>/<series_id>.txt". Exportée pour être appelée en parallèle par
+# xargs -P depuis fetch_arr_inodes_bulk (voir plus bas) : Sonarr n'expose pas
+# d'endpoint global fiable (episodefile sans seriesId retourne parfois HTTP
+# 400), donc un appel par série est nécessaire — mais rien n'empêche de les
+# faire en parallèle plutôt que strictement l'un après l'autre.
+_fetch_sonarr_episodefile() {
+    local series_id="$1" url="$2" key="$3" outdir="$4"
+    local resp
+    # Clé API passée via -K - (stdin), pas en argument -H, pour ne pas
+    # l'exposer dans `ps aux` — d'autant plus visible ici avec jusqu'à 8
+    # appels curl concurrents (voir fetch_arr_inodes_bulk).
+    resp=$(curl -s --connect-timeout 10 --max-time 30 -K - \
+        "${url}/api/v3/episodefile?seriesId=${series_id}" <<CURLCFG 2>/dev/null
+header = "X-Api-Key: $(_curl_cfg_escape "$key")"
+header = "Accept: application/json"
+CURLCFG
+)
+    [ -z "$resp" ] && return
+    printf '%s' "$resp" | python3 -c "
+import sys, json
+try:
+    for f in json.load(sys.stdin):
+        p = f.get('path', '')
+        if p: print(p)
+except: pass
+" > "${outdir}/${series_id}.txt" 2>/dev/null
+}
+export -f _fetch_sonarr_episodefile
+export -f _curl_cfg_escape
+
 # Récupère tous les chemins de fichiers gérés par les Arr.
 # Radarr v3 : /api/v3/movie (movieFile / movieFiles)
 # Sonarr v3 : fallback series → episodefile?seriesId= car /episodefile global
@@ -814,13 +877,19 @@ fetch_arr_inodes_bulk() {
 
     if [ "$app" = "radarr" ]; then
         local response http_code payload
-        response=$(curl -s -w "\n%{http_code}" --connect-timeout 10 --max-time 30 \
-            -H "X-Api-Key: ${key}" \
-            -H "Accept: application/json" \
-            "${url}/api/v3/movie" 2>/dev/null)
+        debug_log "fetch_arr_inodes_bulk [radarr] GET ${url}/api/v3/movie"
+        # Clé API passée via -K - (stdin), pas en argument -H, pour ne pas
+        # l'exposer dans `ps aux` le temps de l'appel.
+        response=$(curl -s -w "\n%{http_code}" --connect-timeout 10 --max-time 30 -K - \
+            "${url}/api/v3/movie" <<CURLCFG 2>/dev/null
+header = "X-Api-Key: $(_curl_cfg_escape "$key")"
+header = "Accept: application/json"
+CURLCFG
+)
 
         http_code=$(printf '%s' "$response" | tail -n 1)
         payload=$(printf '%s' "$response" | sed '$d')
+        debug_log "fetch_arr_inodes_bulk [radarr] HTTP $http_code"
 
         if [ "$http_code" = "200" ] && [ -n "$payload" ]; then
             printf '%s' "$payload" | python3 -c "
@@ -847,36 +916,42 @@ except Exception as e:
 
     elif [ "$app" = "sonarr" ]; then
         local response http_code payload
-        response=$(curl -s -w "\n%{http_code}" --connect-timeout 10 --max-time 30 \
-            -H "X-Api-Key: ${key}" \
-            -H "Accept: application/json" \
-            "${url}/api/v3/series" 2>/dev/null)
+        debug_log "fetch_arr_inodes_bulk [sonarr] GET ${url}/api/v3/series"
+        response=$(curl -s -w "\n%{http_code}" --connect-timeout 10 --max-time 30 -K - \
+            "${url}/api/v3/series" <<CURLCFG 2>/dev/null
+header = "X-Api-Key: $(_curl_cfg_escape "$key")"
+header = "Accept: application/json"
+CURLCFG
+)
 
         http_code=$(printf '%s' "$response" | tail -n 1)
         payload=$(printf '%s' "$response" | sed '$d')
+        debug_log "fetch_arr_inodes_bulk [sonarr] HTTP $http_code"
 
         if [ "$http_code" != "200" ]; then
             printf '⚠️ HTTP %s (series)\n' "$http_code"
             > "$cache_raw"
         else
             > "$cache_raw"
-            local series_id
-            while IFS= read -r series_id; do
-                [ -z "$series_id" ] && continue
-                local ef_resp
-                ef_resp=$(curl -s --connect-timeout 10 --max-time 30 \
-                    -H "X-Api-Key: ${key}" \
-                    -H "Accept: application/json" \
-                    "${url}/api/v3/episodefile?seriesId=${series_id}" 2>/dev/null)
-                [ -n "$ef_resp" ] && printf '%s' "$ef_resp" | python3 -c "
+            local series_count
+            series_count=$(printf '%s' "$payload" | python3 -c "
 import sys, json
 try:
-    for f in json.load(sys.stdin):
-        p = f.get('path', '')
-        if p: print(p)
-except: pass
-" >> "$cache_raw" 2>/dev/null
-            done < <(printf '%s' "$payload" | python3 -c "
+    print(len(json.load(sys.stdin)))
+except: print('0')
+" 2>/dev/null)
+            [[ "$series_count" =~ ^[0-9]+$ ]] || series_count=0
+
+            if [ "$series_count" -gt 0 ]; then
+                # CORRECTION PERF : un appel API par série est incontournable
+                # (Sonarr n'expose pas d'endpoint fiable pour tout récupérer
+                # d'un coup), mais rien n'oblige à les faire un par un — gros
+                # gain sur les grosses bibliothèques. 8 requêtes en parallèle :
+                # compromis entre vitesse et charge sur l'instance Sonarr.
+                local parallel_dir
+                parallel_dir=$(mktemp -d "${TMPDIR}/sonarr_fetch.XXXXXX")
+                debug_log "fetch_arr_inodes_bulk [sonarr] $series_count série(s), 8 requêtes en parallèle"
+                printf '%s' "$payload" | python3 -c "
 import sys, json
 try:
     for s in json.load(sys.stdin):
@@ -884,15 +959,12 @@ try:
         if sid:
             print(sid)
 except: pass
-")
+" | xargs -P 8 -I{} bash -c '_fetch_sonarr_episodefile "$@"' _ {} "$url" "$key" "$parallel_dir"
+                cat "$parallel_dir"/*.txt > "$cache_raw" 2>/dev/null
+                rm -rf "$parallel_dir"
+            fi
+
             if [ -s "$cache_raw" ]; then
-                local series_count
-                series_count=$(printf '%s' "$payload" | python3 -c "
-import sys, json
-try:
-    print(len(json.load(sys.stdin)))
-except: print('?')
-")
                 printf 'OK (%s séries)\n' "$series_count"
             else
                 printf '⚠️ vide\n'
@@ -1495,7 +1567,7 @@ main() {
         printf '   [%s] %d torrent(s)\n' "$instance" "$count"
 
         # tracker/seeding_time sont déjà dans /torrents/info : on les capture
-        # ici pour éviter un appel API séparé par torrent en Phase 4.5.
+        # ici pour éviter un appel API séparé par torrent en Phase 6.
         while IFS='|' read -r hash name save_path size tracker seeding_time; do
             [ -z "$hash" ] && continue
             hash="${hash^^}"
@@ -1527,6 +1599,7 @@ for t in data:
 
 
     local torrent_direct=0 torrent_cross_linked=0 torrent_orphan=0 torrent_partial=0 repaired_count=0
+    local torrent_no_media=0 torrent_delete_ready=0
 
     # -------------------------------------------------------------------------
     # PHASE 1 : Inodes des Arr (Radarr/Sonarr)
@@ -1618,8 +1691,8 @@ for t in data:
     printf 'PHASE 2 — Marquage des torrents liés (inodes Arr)\n'
     printf '═══════════════════════════════════════════════════════════════\n'
 
-    local arr_matched=0 arr_skipped=0 arr_partial=0 idx=0
-    local cache_key cached_entry cached_status hpath found_arr all_arr any_file f finode
+    local arr_matched=0 arr_skipped=0 arr_partial=0 arr_cross_matched=0 idx=0
+    local cache_key cached_entry cached_status hpath found_arr all_arr any_file any_cross f finode
     for hash in "${!TORRENT_NAMES[@]}"; do
         idx=$((idx + 1))
         instance="${TORRENT_INSTANCE[$hash]}"
@@ -1646,11 +1719,20 @@ for t in data:
         # "linked" en entier (les 9 autres resteraient alors de vrais
         # doublons non dédupliqués, jamais signalés ni réparés) : il est
         # marqué "partial" à la place. On en profite pour renseigner
-        # INODE_IN_MEDIA au passage (évite de rescanner ces fichiers en
-        # Phase 3 pour ceux qui finissent linked/partial).
+        # INODE_IN_MEDIA/INODE_IN_CROSS au passage (évite de rescanner ces
+        # fichiers en Phase 3 pour ceux qui finissent linked/partial).
+        #
+        # CORRECTION : cette phase vérifie maintenant aussi CROSS_SEED_INODES,
+        # pas seulement ARR_MANAGED_INODES. Avant, un torrent entièrement lié
+        # aux Arr était toujours tagué "linked" ici et mis en cache aussitôt,
+        # ce qui l'excluait définitivement de la Phase 3/4 — le seul endroit
+        # qui savait détecter "cross-linked". Résultat : ce tag ne pouvait
+        # structurellement jamais être appliqué. La détection cross-seed doit
+        # se faire ici, au moment même de la décision linked/partial.
         found_arr=false
         all_arr=true
         any_file=false
+        any_cross=false
         while IFS= read -r -d '' f; do
             any_file=true
             finode=$(stat -c '%i' "$f" 2>/dev/null || echo "0")
@@ -1661,13 +1743,26 @@ for t in data:
                 all_arr=false
                 INODE_IN_MEDIA["$finode"]=false
             fi
+            if [ -n "${CROSS_SEED_INODES[$finode]:-}" ]; then
+                any_cross=true
+                INODE_IN_CROSS["$finode"]=true
+            else
+                INODE_IN_CROSS["$finode"]=false
+            fi
         done < <(find "$hpath" -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.ts" -o -iname "*.m4v" -o -iname "*.mov" -o -iname "*.wmv" -o -iname "*.flv" -o -iname "*.webm" \) -print0 2>/dev/null)
 
         if $any_file && $found_arr && $all_arr; then
-            batch_add "$instance" "$TAG_LINKED" "$hash"
-            save_torrent_entry "$hash" "$instance" "linked"
-            arr_matched=$((arr_matched + 1))
-            printf '\r   [%3d/%3d] ✅ [%s] Arr lié %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+            if $any_cross; then
+                batch_add "$instance" "$TAG_CROSS_LINKED" "$hash"
+                save_torrent_entry "$hash" "$instance" "cross_linked"
+                arr_cross_matched=$((arr_cross_matched + 1))
+                printf '\r   [%3d/%3d] 🔗 [%s] Arr cross-linked %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+            else
+                batch_add "$instance" "$TAG_LINKED" "$hash"
+                save_torrent_entry "$hash" "$instance" "linked"
+                arr_matched=$((arr_matched + 1))
+                printf '\r   [%3d/%3d] ✅ [%s] Arr lié %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+            fi
         elif $found_arr; then
             batch_add "$instance" "$TAG_PARTIAL" "$hash"
             save_torrent_entry "$hash" "$instance" "partial"
@@ -1678,7 +1773,8 @@ for t in data:
         fi
     done
     printf '\n'
-    printf '   ✓ Arr : %d lié(s) (dont %d depuis cache), %d partiel(s)\n' "$arr_matched" "$arr_skipped" "$arr_partial"
+    printf '   ✓ Arr : %d lié(s) (dont %d depuis cache), %d cross-linked, %d partiel(s)\n' \
+        "$arr_matched" "$arr_skipped" "$arr_cross_matched" "$arr_partial"
     printf '\n'
 
     # CORRECTION : inclure les torrents "linked" retrouvés via le cache
@@ -1687,6 +1783,7 @@ for t in data:
     # bénéficiait du cache.
     torrent_direct=$((arr_matched + arr_skipped))
     torrent_partial=$arr_partial
+    torrent_cross_linked=$((torrent_cross_linked + arr_cross_matched))
 
     # -------------------------------------------------------------------------
     # PHASE 3 : Analyse des inodes des fichiers torrents
@@ -1820,20 +1917,21 @@ for t in data:
             # supprimé en fin de run (nettoyage) sans jamais être réappliqué.
             cached_status4="${cached_entry4%|*}"
             case "$cached_status4" in
-                # "linked" et "partial" ne sont pas comptés ici : la Phase 2
-                # recalcule ces deux statuts À CHAQUE run (elle ne les
-                # court-circuite jamais depuis le cache, contrairement à
-                # "linked"-caché), donc ce hash a déjà été compté dans
-                # torrent_direct/torrent_partial par la Phase 2 ce run-ci.
-                # Un double comptage se produirait sinon.
+                # "linked", "cross_linked" et "partial" ne sont pas comptés
+                # ici : la Phase 2 recalcule ces trois statuts À CHAQUE run
+                # (elle ne les court-circuite jamais depuis le cache, sauf
+                # "linked"-caché qui est déjà compté via arr_skipped), donc
+                # ce hash a déjà été compté par la Phase 2 ce run-ci. Un
+                # double comptage se produirait sinon.
                 linked)       batch_add "$instance" "$TAG_LINKED" "$hash" ;;
                 partial)      batch_add "$instance" "$TAG_PARTIAL" "$hash" ;;
-                cross_linked) batch_add "$instance" "$TAG_CROSS_LINKED" "$hash"
-                              torrent_cross_linked=$((torrent_cross_linked + 1)) ;;
-                no_media)     batch_add "$instance" "$TAG_NO_MEDIA" "$hash" ;;
+                cross_linked) batch_add "$instance" "$TAG_CROSS_LINKED" "$hash" ;;
+                no_media)     batch_add "$instance" "$TAG_NO_MEDIA" "$hash"
+                              torrent_no_media=$((torrent_no_media + 1)) ;;
                 orphan)       batch_add "$instance" "$TAG_ORPHAN" "$hash"
                               torrent_orphan=$((torrent_orphan + 1)) ;;
-                delete_ready) batch_add "$instance" "$TAG_DELETE" "$hash" ;;
+                delete_ready) batch_add "$instance" "$TAG_DELETE" "$hash"
+                              torrent_delete_ready=$((torrent_delete_ready + 1)) ;;
             esac
             continue
         fi
@@ -1875,6 +1973,7 @@ for t in data:
             printf '⚠️  sans média\n'
             batch_add "$instance" "$TAG_NO_MEDIA" "$hash"
             save_torrent_entry "$hash" "$instance" "no_media"
+            torrent_no_media=$((torrent_no_media + 1))
             continue
         fi
 
@@ -2070,6 +2169,7 @@ for t in data:
                 batch_remove "$instance" "$TAG_ORPHAN" "$hash"
                 batch_add "$instance" "$TAG_DELETE" "$hash"
                 save_torrent_entry "$hash" "$instance" "delete_ready"
+                torrent_delete_ready=$((torrent_delete_ready + 1))
             else
                 printf '   [%s] %-40s : %sh < %sh (%s) → conserve Orphelin\n' \
                     "$instance" "${TORRENT_NAMES[$hash]:0:40}" "$seed_hours" "$min_hours" "$tracker_domain"
@@ -2160,6 +2260,8 @@ for t in data:
     printf '║  🔗  Cross-linked           : %6d                      ║\n' "$torrent_cross_linked"
     printf '║  🟡  Partiel                : %6d                      ║\n' "$torrent_partial"
     printf '║  ⚠️   Orphelin              : %6d                      ║\n' "$torrent_orphan"
+    printf '║  📀  Sans média             : %6d                      ║\n' "$torrent_no_media"
+    [ "$torrent_delete_ready" -gt 0 ] && printf '║  🗑️   À effacer              : %6d                      ║\n' "$torrent_delete_ready"
     if [ "$repaired_count" -gt 0 ]; then
         if $DRY_RUN; then
             printf '║  🧪  Fichiers réparables    : %6d (simulation)         ║\n' "$repaired_count"

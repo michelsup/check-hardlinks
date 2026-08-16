@@ -1,5 +1,7 @@
 # check_hardlinks.sh
 
+![CI](https://github.com/michelsup/check-hardlinks/actions/workflows/ci.yml/badge.svg)
+
 Script Bash de dédoublonnage et de gestion des hardlinks entre **qBittorrent** et vos bibliothèques **Radarr / Sonarr**.
 
 Il analyse chaque torrent, vérifie s'il est réellement hardlinké vers la bibliothèque média, le classe automatiquement via des **tags qBittorrent**, peut **réparer** les torrents orphelins (recréer le hardlink manquant), et repère les **fichiers de la bibliothèque** qui n'appartiennent à aucun torrent connu.
@@ -144,7 +146,9 @@ Tous les caches sont sauvegardés automatiquement en cas d'interruption (Ctrl+C)
 ## Sécurité
 
 - `config.conf` (mots de passe qBittorrent, clés API Radarr/Sonarr) et `tracker_secrets.conf` sont automatiquement passés en permissions `600` (lecture propriétaire uniquement).
+- Mots de passe et clés API sont transmis à `curl` via sa configuration (`-K -`, lue sur stdin) plutôt qu'en argument de ligne de commande, pour ne jamais apparaître en clair dans `ps aux` le temps d'un appel.
 - Les réparations utilisent un hardlink **atomique** : le fichier orphelin n'est jamais supprimé avant que son remplaçant soit prêt et vérifié — en cas d'échec ou d'interruption, aucune perte de données.
+- Un verrou (`cleanup/check_hardlinks.lock`) empêche deux exécutions simultanées de se marcher dessus (tags, hardlinks, caches) ; une seconde instance lancée pendant qu'une autre tourne s'arrête immédiatement avec une erreur explicite.
 - `AUTO_REPAIR=true` et `SCAN_DISK_ORPHANS=true` déclenchent des opérations réelles sur le système de fichiers et sur vos instances qBittorrent (tags, hardlinks). Utilisez `--dry-run` pour un premier run qui montre tout ce qui serait fait sans rien modifier.
 
 ## Dépannage
@@ -153,4 +157,9 @@ Tous les caches sont sauvegardés automatiquement en cas d'interruption (Ctrl+C)
 - **Torrent classé « orphan » alors qu'il est bien lié** : vérifiez `PATH_MAP` (traduction chemin conteneur → hôte) et que les torrents/la bibliothèque sont bien sur le même filesystem (nécessaire pour un hardlink).
 - **La Phase 5 ne répare presque rien** : normal si beaucoup d'orphelins ont déjà dépassé la durée de seed minimale de leur tracker — ils passent directement par la Phase 6, après une tentative de réparation en Phase 5.
 - **Un tag ne se retire jamais** : vérifiez qu'il figure bien dans `DELETE_TAGS`.
+- **« Une autre instance tourne déjà »** : un run précédent a été interrompu brutalement (`kill -9`) sans libérer le verrou correctement ne devrait pas arriver (le verrou est un descripteur de fichier, relâché automatiquement à la fin du processus) ; si ça persiste, supprimez `cleanup/check_hardlinks.lock`.
+
+## Licence
+
+[MIT](LICENSE)
 - Pour investiguer n'importe lequel de ces cas, lancez avec `--dry-run --debug 2> debug.log` : classification et diagnostic complets, sans aucune écriture.
