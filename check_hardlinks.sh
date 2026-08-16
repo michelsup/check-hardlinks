@@ -134,6 +134,7 @@ UNCACHED_TMP=""
 NO_CACHE=false
 DRY_RUN=false
 DEBUG=false
+FULL_HASH=false
 
 print_usage() {
     cat <<EOF
@@ -150,6 +151,13 @@ Options :
                     ni tag ajouté/retiré dans qBittorrent. Force AUTO_REPAIR
                     à true le temps du run pour prévisualiser les réparations
                     qui seraient tentées, sans jamais les appliquer.
+  --full-hash      Phase 5 (réparation) : exige une confirmation par hash
+                    complet avant de créer un hardlink, en plus du hash
+                    rapide (échantillonné) utilisé par défaut. Plus lent sur
+                    de gros fichiers, mais élimine le risque — infinitésimal
+                    mais non nul — qu'un hash rapide identique corresponde à
+                    des fichiers réellement différents. Sans effet sur les
+                    petits fichiers (déjà vérifiés en entier dans les deux cas).
   --debug          Affiche des informations de diagnostic détaillées sur
                     stderr (préfixées "🐛 [DEBUG]") : requêtes API qBittorrent/
                     Arr avec code HTTP, traduction de chemins, diagnostic complet
@@ -164,6 +172,7 @@ for arg in "$@"; do
     case "$arg" in
         --use-no-cache) NO_CACHE=true ;;
         --dry-run) DRY_RUN=true ;;
+        --full-hash) FULL_HASH=true ;;
         --debug) DEBUG=true ;;
         -h|--help) print_usage; exit 0 ;;
         *)
@@ -1227,34 +1236,39 @@ try_repair_file() {
             printf '✗\n'
             continue
         fi
-        # Pré-filtre passé : confirmation par hash complet avant toute action.
-        if [ -z "$fhash" ]; then
-            fhash=$(file_hash "$orphan_file")
+        # Pré-filtre passé. Par défaut, le hash rapide (échantillonné) fait
+        # foi. Avec --full-hash, on exige en plus une confirmation par hash
+        # complet avant toute action.
+        if $FULL_HASH; then
             if [ -z "$fhash" ]; then
-                printf '❌ (hash complet orphelin impossible)\n'
+                fhash=$(file_hash "$orphan_file")
+                if [ -z "$fhash" ]; then
+                    printf '❌ (hash complet orphelin impossible)\n'
+                    continue
+                fi
+                debug_log "try_repair_file : hash complet orphelin ($HASH_CMD) = $fhash"
+            fi
+            chash=$(file_hash "$candidate")
+            if [ -z "$chash" ]; then
+                printf '❌\n'
                 continue
             fi
-            debug_log "try_repair_file : hash complet orphelin ($HASH_CMD) = $fhash"
-        fi
-        chash=$(file_hash "$candidate")
-        if [ -z "$chash" ]; then
-            printf '❌\n'
-            continue
-        fi
-        if [ "$chash" = "$fhash" ]; then
-            printf '✅ CORRESPONDANCE !\n'
-            printf '       🔧 Hardlink...\n'
-            if create_hardlink_atomic "$candidate" "$orphan_file"; then
-                printf '       ✅ Hardlink créé !\n'
-                do_chown "$orphan_file"
-                unset "HASH_CACHE[$orphan_file]"
-                return 0
-            else
-                printf '       ❌ Échec hardlink\n'
-                return 1
+            if [ "$chash" != "$fhash" ]; then
+                printf '✗ (faux positif hash rapide)\n'
+                continue
             fi
         fi
-        printf '✗ (faux positif hash rapide)\n'
+        printf '✅ CORRESPONDANCE !\n'
+        printf '       🔧 Hardlink...\n'
+        if create_hardlink_atomic "$candidate" "$orphan_file"; then
+            printf '       ✅ Hardlink créé !\n'
+            do_chown "$orphan_file"
+            unset "HASH_CACHE[$orphan_file]"
+            return 0
+        else
+            printf '       ❌ Échec hardlink\n'
+            return 1
+        fi
     done
 
     # Test fallback (noms différents, même taille)
@@ -1278,33 +1292,36 @@ try_repair_file() {
                 printf '✗\n'
                 continue
             fi
-            if [ -z "$fhash" ]; then
-                fhash=$(file_hash "$orphan_file")
+            if $FULL_HASH; then
                 if [ -z "$fhash" ]; then
-                    printf '❌ (hash complet orphelin impossible)\n'
+                    fhash=$(file_hash "$orphan_file")
+                    if [ -z "$fhash" ]; then
+                        printf '❌ (hash complet orphelin impossible)\n'
+                        continue
+                    fi
+                    debug_log "try_repair_file : hash complet orphelin ($HASH_CMD) = $fhash"
+                fi
+                chash=$(file_hash "$candidate")
+                if [ -z "$chash" ]; then
+                    printf '❌\n'
                     continue
                 fi
-                debug_log "try_repair_file : hash complet orphelin ($HASH_CMD) = $fhash"
-            fi
-            chash=$(file_hash "$candidate")
-            if [ -z "$chash" ]; then
-                printf '❌\n'
-                continue
-            fi
-            if [ "$chash" = "$fhash" ]; then
-                printf '✅ CORRESPONDANCE (nom différent) !\n'
-                printf '       🔧 Hardlink...\n'
-                if create_hardlink_atomic "$candidate" "$orphan_file"; then
-                    printf '       ✅ Hardlink créé !\n'
-                    do_chown "$orphan_file"
-                    unset "HASH_CACHE[$orphan_file]"
-                    return 0
-                else
-                    printf '       ❌ Échec hardlink\n'
-                    return 1
+                if [ "$chash" != "$fhash" ]; then
+                    printf '✗ (faux positif hash rapide)\n'
+                    continue
                 fi
             fi
-            printf '✗ (faux positif hash rapide)\n'
+            printf '✅ CORRESPONDANCE (nom différent) !\n'
+            printf '       🔧 Hardlink...\n'
+            if create_hardlink_atomic "$candidate" "$orphan_file"; then
+                printf '       ✅ Hardlink créé !\n'
+                do_chown "$orphan_file"
+                unset "HASH_CACHE[$orphan_file]"
+                return 0
+            else
+                printf '       ❌ Échec hardlink\n'
+                return 1
+            fi
         done
     fi
 
@@ -1579,6 +1596,11 @@ main() {
     printf '\n'
     if $DRY_RUN; then
         printf '🧪 MODE DRY-RUN — aucune écriture réelle (ni filesystem, ni qBittorrent)\n'
+    fi
+    if $FULL_HASH; then
+        printf '🔎 Phase 5 : confirmation par hash complet (--full-hash)\n'
+    else
+        printf '🔎 Phase 5 : hash rapide (échantillonné) — utilisez --full-hash pour une confirmation par hash complet\n'
     fi
     printf '📁 Configuration : %s\n' "$CONFIG_FILE"
     printf '📁 Cache         : %s\n' "$CACHE_DIR"

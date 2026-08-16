@@ -100,12 +100,14 @@ tracker.autre.net=168
 ./check_hardlinks.sh                          # run normal (utilise les caches)
 ./check_hardlinks.sh --use-no-cache            # ignore tous les caches, ré-analyse tout depuis zéro
 ./check_hardlinks.sh --dry-run                 # simulation complète, aucune écriture réelle
+./check_hardlinks.sh --full-hash               # Phase 5 : exige un hash complet, pas seulement échantillonné
 ./check_hardlinks.sh --debug 2> debug.log      # journal de diagnostic détaillé sur stderr
 ./check_hardlinks.sh --help                    # aide
 ```
 
 - `--use-no-cache` force un nouveau scan complet (hash, inodes, statut des torrents, inodes Arr) sans supprimer les caches existants — ils sont réécrits normalement en fin d'exécution pour les prochains runs.
 - `--dry-run` exécute toute l'analyse et la classification normalement, mais **aucune écriture réelle** n'a lieu : ni hardlink/chown sur le filesystem, ni tag ajouté/retiré dans qBittorrent. Force `AUTO_REPAIR=true` le temps du run pour prévisualiser les réparations qui seraient tentées (sans jamais les appliquer). Recommandé pour un premier run sur une nouvelle configuration.
+- `--full-hash` : par défaut, un candidat dont le hash rapide (échantillonné) correspond à l'orphelin est considéré comme une correspondance et hardlinké directement — le plus rapide. Avec `--full-hash`, une confirmation par hash complet est exigée avant tout hardlink, comme avant l'optimisation ; plus lent sur de gros fichiers, mais élimine le risque (infinitésimal mais non nul) qu'un hash rapide identique corresponde à des fichiers réellement différents. Sans effet sur les petits fichiers (déjà vérifiés en entier dans les deux cas).
 - `--debug` affiche sur stderr (préfixé `🐛 [DEBUG]`, n'affecte jamais la sortie normale sur stdout) : chaque requête API qBittorrent/Radarr/Sonarr avec son code HTTP, les traductions `PATH_MAP` appliquées, le diagnostic complet de chaque tentative de hardlink (device, inode, permissions), et les hashs comparés lors de la réparation (Phase 5). Combinable avec `--dry-run` pour investiguer un problème sans rien modifier.
 
 ## Les 10 phases
@@ -125,7 +127,7 @@ tracker.autre.net=168
 
 Un torrent `orphan` ou `partial` réparé en Phase 5 devient `linked` s'il est entièrement corrigé, ou reste `partial` si seulement une partie de ses fichiers a pu être réparée. Un torrent `partial` n'est **jamais** proposé à la suppression (Phase 6) : il contient de vrais fichiers non dupliqués ailleurs.
 
-**Performance de la Phase 5** : avant de comparer deux fichiers de même taille par hash complet (coûteux sur des fichiers vidéo de plusieurs Go), un hash rapide par échantillonnage (début/milieu/fin, ~3 Mo au lieu de tout le fichier) sert de pré-filtre. Le hash complet n'est calculé que pour confirmer une correspondance déjà trouvée par échantillonnage — jamais pour rejeter un candidat, et jamais pour l'orphelin lui-même s'il ne trouve finalement aucune correspondance.
+**Performance de la Phase 5** : par défaut, deux fichiers de même taille sont comparés par hash rapide par échantillonnage (début/milieu/fin, ~3 Mo au lieu de tout le fichier vidéo) — un candidat qui correspond est hardlinké directement, sans hash complet. Utilisez `--full-hash` pour exiger en plus une confirmation par hash complet avant chaque hardlink (plus lent, plus rigoureux).
 
 ## Tags appliqués
 
