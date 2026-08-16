@@ -1,0 +1,133 @@
+#!/bin/bash
+# =============================================================================
+# config.conf.example — Modèle de configuration pour check_hardlinks.sh
+# -----------------------------------------------------------------------------
+# Copiez ce fichier vers config.conf (même dossier) puis éditez-le avec vos
+# propres valeurs :
+#
+#   cp config.conf.example config.conf
+#
+# config.conf contient des identifiants en clair et n'est jamais versionné
+# (voir .gitignore) — ce fichier .example, lui, est publié tel quel.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. INSTANCES QBITTORRENT
+# -----------------------------------------------------------------------------
+# Liste des instances à surveiller. Chaque instance doit être définie
+# avec son URL, son utilisateur et son mot de passe ci-dessous.
+# Les noms ici doivent correspondre exactement aux variables QBIT_*_URL.
+INSTANCES=("VPN" "DIRECT")
+
+# Instance VPN (ex: qBittorrent derrière un VPN, container "qbittorrent-vpn")
+QBIT_VPN_URL="http://127.0.0.1:8085"
+QBIT_VPN_USER="admin"
+QBIT_VPN_PASS="changeme"
+
+# Instance Direct (ex: qBittorrent direct, container "qbittorrent")
+QBIT_DIRECT_URL="http://127.0.0.1:8060"
+QBIT_DIRECT_USER="admin"
+QBIT_DIRECT_PASS="changeme"
+
+# -----------------------------------------------------------------------------
+# 2. TAGS QBITTORRENT
+# -----------------------------------------------------------------------------
+# Ces tags sont créés automatiquement dans qBittorrent.
+# Ils doivent correspondre exactement aux noms de tags dans l'interface web.
+TAG_LINKED="linked"
+TAG_CROSS_LINKED="cross-linked"
+TAG_PARTIAL="partial"
+TAG_NO_MEDIA="no-media"
+TAG_ORPHAN="orphan"
+TAG_DELETE="delete-ready"
+
+# Liste des tags à supprimer AVANT d'appliquer les nouveaux.
+# Permet de "nettoyer" les anciens tags pour éviter les cumuls.
+DELETE_TAGS=("linked" "cross-linked" "partial" "no-media" "orphan" "delete-ready")
+
+# -----------------------------------------------------------------------------
+# 3. RÉPERTOIRES DE MÉDIAS (Arr)
+# -----------------------------------------------------------------------------
+# Chemins HÔTE (pas Docker) vers les répertoires surveillés par Radarr/Sonarr.
+# Le script compare les inodes des fichiers torrents avec ceux des médias.
+declare -A MEDIA_DIRS
+MEDIA_DIRS=(
+    ["films"]="/mnt/tank/medias/films"
+    ["series"]="/mnt/tank/medias/series"
+)
+
+# (Optionnel) Répertoire de cross-seed. Si un torrent y est présent ET que ses
+# fichiers sont dans les médias, il est tagué "cross-linked" au lieu de "linked".
+# Laisser vide "" pour désactiver.
+CROSS_SEED_DIR=""
+
+# -----------------------------------------------------------------------------
+# 4. TRANSLATION DE CHEMINS (Docker → Hôte)
+# -----------------------------------------------------------------------------
+# Map des chemins vus par les containers vers les chemins réels sur l'hôte.
+# Syntaxe : PATH_MAP[chemin_container]="chemin_hote"
+# Ex: si qBittorrent voit /data/completed mais l'hôte voit /mnt/tank/torrents :
+declare -A PATH_MAP
+PATH_MAP["/downloads"]="/mnt/tank/medias"
+
+# -----------------------------------------------------------------------------
+# 5. CONFIGURATION RADARR / SONARR
+# -----------------------------------------------------------------------------
+# Map instance qBittorrent → "app|URL|API_KEY".
+# Permet de lier chaque instance à son Arr correspondant.
+# "app" doit être "radarr" ou "sonarr".
+declare -A ARR_CONFIG
+ARR_CONFIG["VPN|radarr"]="https://radarr.example.com|CHANGEME_API_KEY"
+ARR_CONFIG["VPN|sonarr"]="https://sonarr.example.com|CHANGEME_API_KEY"
+ARR_CONFIG["DIRECT|radarr"]="https://radarr.example.com|CHANGEME_API_KEY"
+ARR_CONFIG["DIRECT|sonarr"]="https://sonarr.example.com|CHANGEME_API_KEY"
+
+# -----------------------------------------------------------------------------
+# 6. RÉPARATION & PROPRIÉTAIRE DES FICHIERS CRÉÉS (Optionnel)
+# -----------------------------------------------------------------------------
+# AUTO_REPAIR : si true, tente de hardlinker automatiquement les fichiers
+# orphelins/partiels retrouvés dans MEDIA_DIRS (Phase 5).
+AUTO_REPAIR=false
+
+# CHOWN_FILES : si true, applique CHOWN_USER aux fichiers hardlinkés créés.
+# Utile si Radarr/Sonarr utilisent un utilisateur spécifique.
+CHOWN_FILES=false
+CHOWN_USER="user:group"
+
+# -----------------------------------------------------------------------------
+# 7. STOPWORDS (Normalisation des noms)
+# -----------------------------------------------------------------------------
+# Mots à ignorer lors de la comparaison de noms de fichiers.
+# Aide à matcher "The.Movie.2023" avec "Movie.2023.1080p".
+STOPWORDS=(
+    "the" "a" "an" "le" "la" "les" "un" "une"
+    "1080p" "720p" "2160p" "4k" "uhd" "hdr" "dv"
+    "bluray" "web-dl" "webdl" "hdtv" "dvdrip"
+    "x264" "x265" "hevc" "avc"
+    "dts" "dd" "aac" "truehd" "atmos"
+    "remux" "repack" "proper" "extended"
+)
+
+# -----------------------------------------------------------------------------
+# 8. CACHE ARR (Radarr/Sonarr)
+# -----------------------------------------------------------------------------
+# Durée de validité du cache des inodes Arr en secondes.
+# 0 = toujours interroger l'API (pas de cache)
+# 3600 = 1 heure (défaut)
+ARR_CACHE_DURATION=3600
+
+# -----------------------------------------------------------------------------
+# 9. ORPHELINS DE DISQUE (Phase 7)
+# -----------------------------------------------------------------------------
+# Active le scan des fichiers médias qui ne sont gérés par personne.
+SCAN_DISK_ORPHANS=false
+
+# Chemin du rapport (log) à générer.
+DISK_ORPHAN_LOG="${SCRIPT_DIR}/cleanup/disk_orphans.log"
+
+# Taille minimale (en octets) pour ignorer les images/subs/NFO.
+# 52428800 = 50 MiB. Mettre 0 pour tout lister.
+DISK_ORPHAN_MIN_SIZE=52428800
+
+# Extensions cibles (optionnel). Vide = tous les fichiers.
+# DISK_ORPHAN_EXTENSIONS=("mkv" "mp4" "avi" "ts")

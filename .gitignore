@@ -1,0 +1,11 @@
+# Configuration réelle (identifiants qBittorrent + clés API Radarr/Sonarr)
+# — seul cleanup/config.conf.example est versionné.
+cleanup/config.conf
+
+# Durées de seed par tracker (généré automatiquement, spécifique à l'utilisateur)
+cleanup/tracker_secrets.conf
+
+# Caches et journaux générés par le script à l'exécution
+cleanup/*.txt
+cleanup/disk_orphans.log
+disk_orphans.log
