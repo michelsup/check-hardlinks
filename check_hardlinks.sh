@@ -43,6 +43,8 @@ fi
 # on restreint ses permissions pour qu'il ne soit lisible que par son propriétaire.
 chmod 600 "$CONFIG_FILE" 2>/dev/null
 
+# shellcheck source=cleanup/config.conf.example
+# shellcheck disable=SC1091
 source "$CONFIG_FILE"
 
 # Valeurs par défaut pour toutes les variables de configuration (set -u safe)
@@ -61,9 +63,89 @@ AUTO_REPAIR="${AUTO_REPAIR:-false}"
 SCAN_DISK_ORPHANS="${SCAN_DISK_ORPHANS:-false}"
 DISK_ORPHAN_LOG="${DISK_ORPHAN_LOG:-${SCRIPT_DIR}/disk_orphans.log}"
 DISK_ORPHAN_MIN_SIZE="${DISK_ORPHAN_MIN_SIZE:-0}"
-DISK_ORPHAN_EXTENSIONS=("${DISK_ORPHAN_EXTENSIONS[@]:-}")
 CROSS_SEED_DIR="${CROSS_SEED_DIR:-}"
-TMPDIR="${TMPDIR:-/tmp}"
+
+# Répertoire de travail temporaire. Tout ce qu'on y écrit est éphémère et
+# reconstruit à chaque run (mémo de parcours, listes d'inodes intermédiaires,
+# réponses Sonarr) : autant rester en RAM plutôt que d'infliger ces
+# écritures au pool de stockage. On respecte TMPDIR s'il est explicitement
+# défini par l'utilisateur, sinon on préfère /dev/shm — tmpfs garanti sous
+# Linux — et on retombe sur /tmp (souvent déjà un tmpfs) en dernier recours.
+if [ -n "${TMPDIR:-}" ]; then
+    :
+elif [ -d /dev/shm ] && [ -w /dev/shm ]; then
+    TMPDIR=/dev/shm
+else
+    TMPDIR=/tmp
+fi
+
+# Durée de validité d'un statut de torrent mis en cache (secondes). Passé ce
+# délai, le torrent est reclassifié de zéro.
+# CORRECTION : le timestamp écrit dans torrent_status.txt était relu mais
+# jamais comparé à quoi que ce soit — un statut « no_media », « orphan » ou
+# « delete_ready » était donc définitif. Une seule classification erronée
+# (ex. scan de fichiers vide à cause d'une défaillance ponctuelle) restait
+# gravée pour toujours. 86400 = 24 h.
+TORRENT_STATUS_TTL="${TORRENT_STATUS_TTL:-86400}"
+
+# CORRECTION : "${X[@]:-}" sur un tableau absent produit UN élément vide, pas
+# un tableau vide — "${#DISK_ORPHAN_EXTENSIONS[@]}" valait donc 1 et le test
+# "-gt 0" passait à tort (le filtre était sauvé uniquement parce que la
+# jointure d'un unique élément vide redonne une chaîne vide).
+if declare -p DISK_ORPHAN_EXTENSIONS &>/dev/null; then
+    DISK_ORPHAN_EXTENSIONS=("${DISK_ORPHAN_EXTENSIONS[@]}")
+else
+    DISK_ORPHAN_EXTENSIONS=()
+fi
+
+# -----------------------------------------------------------------------------
+# VALIDATION DE LA CONFIGURATION
+# -----------------------------------------------------------------------------
+# CORRECTION : sous `set -u`, "${MEDIA_DIRS[@]}" sur un tableau totalement
+# absent ne déclenche PAS d'erreur (contrairement à "${#X[@]}" sur un
+# `declare -A` nu) — l'expansion est silencieusement vide. Un config.conf
+# amputé de MEDIA_DIRS tournait donc jusqu'au bout en classant absolument
+# tous les torrents en « orphelin », sans le moindre avertissement. On
+# vérifie donc explicitement ce dont le script a besoin pour être correct.
+config_errors=()
+
+if [ "${#INSTANCES[@]}" -eq 0 ]; then
+    config_errors+=('INSTANCES est vide ou absent (ex: INSTANCES=("VPN" "DIRECT"))')
+else
+    for inst in "${INSTANCES[@]}"; do
+        # qbit_vars() ne sait résoudre que ces deux noms : tout autre nom
+        # échouerait plus tard à la connexion, sans message explicite.
+        case "$inst" in
+            VPN|DIRECT) ;;
+            *) config_errors+=("INSTANCES contient \"$inst\" : seuls \"VPN\" et \"DIRECT\" sont gérés") ;;
+        esac
+        for suffix in URL USER PASS; do
+            varname="QBIT_${inst}_${suffix}"
+            [ -z "${!varname:-}" ] && config_errors+=("$varname non défini (requis par INSTANCES=\"$inst\")")
+        done
+    done
+fi
+
+if ! declare -p MEDIA_DIRS &>/dev/null || [ "${#MEDIA_DIRS[@]}" -eq 0 ]; then
+    config_errors+=('MEDIA_DIRS est vide ou absent : sans bibliothèque de référence, tous les torrents seraient classés orphelins')
+fi
+
+declare -p PATH_MAP    &>/dev/null || config_errors+=('PATH_MAP absent (déclarez au moins "declare -A PATH_MAP" même vide)')
+declare -p ARR_CONFIG  &>/dev/null || config_errors+=('ARR_CONFIG absent (déclarez au moins "declare -A ARR_CONFIG" même vide)')
+declare -p STOPWORDS   &>/dev/null || STOPWORDS=()
+
+[ "${#DELETE_TAGS[@]}" -eq 0 ] && \
+    printf '⚠️  DELETE_TAGS est vide : les anciens tags ne seront pas nettoyés (Phase 8).\n' >&2
+
+if [ "${#config_errors[@]}" -gt 0 ]; then
+    printf '❌ Configuration invalide (%s) :\n' "$CONFIG_FILE" >&2
+    for cfg_err in "${config_errors[@]}"; do
+        printf '   • %s\n' "$cfg_err" >&2
+    done
+    printf '\n   Référez-vous à cleanup/config.conf.example.\n' >&2
+    exit 1
+fi
+unset config_errors cfg_err inst suffix varname
 
 CACHE_DIR="${SCRIPT_DIR}/cleanup"
 mkdir -p "$CACHE_DIR"
@@ -88,6 +170,12 @@ declare -A QBIT_COOKIES=()
 # Caches disque
 declare -A HASH_CACHE=()
 declare -A INODE_STATUS_CACHE=()
+# Chemin d'un fichier témoin par inode. CORRECTION : save_inode_cache_bulk
+# écrivait un sample_path vide, alors que load_inode_cache rejette toute
+# entrée sans fichier témoin existant — 100 % du cache d'inodes était donc
+# jeté au rechargement suivant. On mémorise le témoin pour pouvoir le
+# réécrire.
+declare -A INODE_SAMPLE_PATH=()
 declare -A TORRENT_CACHE=()
 
 # Métadonnées torrents
@@ -100,8 +188,36 @@ declare -A TORRENT_HOST_PATH=()
 declare -A TORRENT_TRACKER=()
 declare -A TORRENT_SEEDING_TIME=()
 
-# Inodes gérés par les Arr (Radarr/Sonarr)
+# Inodes présents dans la bibliothèque : union des fichiers réellement
+# déclarés par l'API Radarr/Sonarr ET du scan direct de MEDIA_DIRS. C'est
+# cette union qui répond à « ce fichier est-il dans la bibliothèque ? »
+# (Phases 2 à 5).
 declare -A ARR_MANAGED_INODES=()
+
+# Provenance de chaque inode ci-dessus : "api" (Radarr/Sonarr le déclare
+# explicitement) ou "scan" (simplement trouvé dans MEDIA_DIRS).
+# CORRECTION : sans cette distinction, la Phase 7 était structurellement
+# incapable de trouver quoi que ce soit. scan_media_dirs_for_inodes() injecte
+# TOUS les fichiers média de MEDIA_DIRS dans ARR_MANAGED_INODES, et la
+# Phase 7 se servait de ce même ensemble comme filtre « déjà connu » — donc
+# tout fichier de la bibliothèque était connu par construction, y compris un
+# vrai orphelin. Un orphelin de disque se définit par rapport aux fichiers
+# que les Arr revendiquent (source "api"), pas par rapport à ce qui traîne
+# sur le disque.
+declare -A ARR_INODE_SOURCE=()
+
+# Index « taille du fichier → candidats de réparation », construit une seule
+# fois en Phase 1 par scan_media_dirs_for_inodes. Chaque ligne d'une entrée
+# vaut "device<TAB>inode<TAB>chemin".
+#
+# Ne contient QUE les fichiers de provenance "api". Un fichier présent dans
+# MEDIA_DIRS mais que Radarr/Sonarr ne revendiquent pas est précisément ce
+# que la Phase 7 signale comme orphelin de disque : en faire une cible de
+# hardlink donnerait un gain fictif (le torrent redeviendrait une copie
+# isolée dès la suppression de ce fichier) tout en masquant le fait que
+# l'import Arr n'a jamais eu lieu.
+declare -A MEDIA_SIZE_INDEX=()
+MEDIA_SIZE_INDEX_READY=false
 
 # Inodes présents sous CROSS_SEED_DIR
 declare -A CROSS_SEED_INODES=()
@@ -112,6 +228,13 @@ declare -A INODE_IN_CROSS=()
 
 # Batches de tags à appliquer par instance
 declare -A TAG_BATCHES=()
+# Garde d'unicité pour batch_add (clé "instance|tag|hash").
+# CORRECTION : la Phase 2 classe un torrent puis l'écrit dans TORRENT_CACHE,
+# et la Phase 4 relit ce cache tout juste écrit et refait un batch_add — le
+# même hash se retrouvait donc deux fois dans le lot. La Phase 9 dédoublonne
+# avec `sort -u`, mais la Phase 5 itère la chaîne brute : chaque torrent
+# partiel était réparé deux fois, gonflant repaired_count et orphan_count.
+declare -A BATCH_SEEN=()
 
 # Initialisation des batches pour éviter les variables unbound
 for inst in "${INSTANCES[@]}"; do
@@ -128,6 +251,11 @@ HASH_JOURNAL_FILE="${CACHE_DIR}/hash_journal.txt"
 INODE_CACHE_FILE="${CACHE_DIR}/inode_status.txt"
 TORRENT_CACHE_FILE="${CACHE_DIR}/torrent_status.txt"
 ARR_INODES_FILE="${CACHE_DIR}/arr_inodes.txt"
+# Un arr_inodes.txt écrit par une version antérieure n'a pas la colonne de
+# provenance : impossible d'y distinguer "api" de "scan". On force alors une
+# réinterrogation de l'API plutôt que de deviner (deviner "scan" ferait
+# remonter toute la bibliothèque en orphelins de disque au premier run).
+ARR_CACHE_LEGACY=false
 
 # Seuils
 HASH_MERGE_THRESHOLD=50
@@ -245,6 +373,8 @@ CLEANUP_DONE=false
 
 # Sauvegarde groupée de tous les caches disque + nettoyage des fichiers
 # temporaires. Appelée aussi bien en fin de run normale qu'en cas d'interruption.
+# Appelée indirectement (trap) — d'où la désactivation de SC2317.
+# shellcheck disable=SC2317
 save_all_caches() {
     save_hash_cache_merge
     save_torrent_list_cache
@@ -252,9 +382,13 @@ save_all_caches() {
     save_inode_cache_bulk
     save_torrent_cache_bulk
     rm -f "$ALL_FILES_TMP" "${UNCACHED_TMP}" "${UNCACHED_TMP}.sorted" 2>/dev/null
+    [ -n "$SCAN_MEMO_DIR" ] && rm -rf "$SCAN_MEMO_DIR" 2>/dev/null
+    return 0
 }
 
 # Interruption explicite (Ctrl+C, kill, déconnexion du terminal)
+# Appelée indirectement (trap) — d'où la désactivation de SC2317.
+# shellcheck disable=SC2317
 cleanup_on_signal() {
     $CLEANUP_DONE && return
     CLEANUP_DONE=true
@@ -266,6 +400,8 @@ cleanup_on_signal() {
 
 # Fin de script (normale OU après cleanup_on_signal) : sauvegarde silencieuse,
 # sans écraser le code de sortie déjà déterminé.
+# Appelée indirectement (trap) — d'où la désactivation de SC2317.
+# shellcheck disable=SC2317
 cleanup_on_exit() {
     $CLEANUP_DONE && return
     CLEANUP_DONE=true
@@ -292,7 +428,11 @@ _curl_cfg_escape() {
 }
 
 # Chown optionnel si les fichiers créés doivent appartenir à un utilisateur
-do_chown()  { ! $DRY_RUN && $CHOWN_FILES && chown "$CHOWN_USER" "$1" 2>/dev/null || true; }
+do_chown() {
+    $DRY_RUN && return 0
+    $CHOWN_FILES || return 0
+    chown "$CHOWN_USER" "$1" 2>/dev/null || true
+}
 
 # Sélection du meilleur outil de hachage disponible
 pick_hash_tool() {
@@ -351,7 +491,41 @@ for root in sys.argv[2:]:
             if not stat.S_ISREG(st.st_mode):
                 continue
             print(f'{st.st_ino}\t{st.st_size}\t{full}')
-" "$exts_csv" "$@" 2>/dev/null
+" "$exts_csv" "$@"
+}
+
+# Mémoïsation du parcours des fichiers média d'un torrent : le même
+# répertoire est parcouru par les Phases 2, 3, 4 ET 5 au cours d'un même run,
+# soit jusqu'à quatre parcours identiques par torrent orphelin.
+#
+# Le mémo est sur DISQUE et non dans un tableau bash : ces parcours sont
+# consommés via une substitution de processus (`done < <(...)`), qui exécute
+# la fonction dans un sous-shell — un tableau associatif modifié là serait
+# perdu au retour, et la mémoïsation n'aurait servi à rien. Un fichier, lui,
+# est bien visible par le shell parent au parcours suivant.
+#
+# Clé = hash du torrent : déjà unique, déjà hexadécimal, donc utilisable tel
+# quel comme nom de fichier sans échappement ni risque de collision.
+SCAN_MEMO_DIR=""
+
+scan_torrent_files() {
+    local hash="$1" hpath="$2"
+    if [ -z "$SCAN_MEMO_DIR" ]; then
+        scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath"
+        return 0
+    fi
+    local memo="${SCAN_MEMO_DIR}/${hash}"
+    # -f et non -s : un torrent sans fichier média donne un mémo vide, qu'il
+    # ne faut pas reconstruire à chaque phase.
+    [ -f "$memo" ] || scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath" > "$memo"
+    cat "$memo"
+}
+
+# Invalide le mémo (après la Phase 5, qui remplace des fichiers par des
+# hardlinks et change donc leurs inodes).
+reset_scan_memo() {
+    [ -n "$SCAN_MEMO_DIR" ] && [ -d "$SCAN_MEMO_DIR" ] && rm -f "${SCAN_MEMO_DIR:?}"/* 2>/dev/null
+    return 0
 }
 
 # Variante filtrée par taille exacte (octets), sans filtre d'extension —
@@ -375,12 +549,16 @@ for root in sys.argv[2:]:
             if not stat.S_ISREG(st.st_mode) or st.st_size != target_size:
                 continue
             print(f'{st.st_ino}\t{st.st_size}\t{full}')
-" "$size" "$@" 2>/dev/null
+" "$size" "$@"
 }
 
 # Stat en lot une liste de chemins (un par ligne sur stdin, pour éviter toute
 # limite ARG_MAX sur de grosses listes) : retourne "inode<TAB>chemin" pour
 # chaque chemin qui existe encore.
+# os.lstat (et non os.stat) pour rester cohérent avec scan_files : un lien
+# symbolique doit rapporter son propre inode, jamais celui de sa cible —
+# sinon un symlink de la bibliothèque ferait passer sa cible pour un fichier
+# géré par les Arr.
 stat_paths_bulk() {
     python3 -c "
 import os, sys
@@ -389,11 +567,11 @@ for line in sys.stdin:
     if not path:
         continue
     try:
-        st = os.stat(path)
+        st = os.lstat(path)
     except OSError:
         continue
     print(f'{st.st_ino}\t{path}')
-" 2>/dev/null
+"
 }
 
 # -----------------------------------------------------------------------------
@@ -441,7 +619,10 @@ translate_path() {
     local container_prefix matched=""
     for container_prefix in "${PATH_MAP_SORTED_PREFIXES[@]}"; do
         if [[ "$container_path" == "$container_prefix"/* ]]; then
-            local suffix="${container_path#$container_prefix/}"
+            # Préfixe entre guillemets DANS l'expansion : sans ça, un chemin
+            # PATH_MAP contenant *, ? ou [ serait interprété comme un motif
+            # au lieu d'un littéral, et retirerait la mauvaise portion.
+            local suffix="${container_path#"$container_prefix"/}"
             host_path="${PATH_MAP[$container_prefix]%/}/${suffix}"
             matched="$container_prefix"
             break
@@ -542,7 +723,7 @@ save_hash_cache_merge() {
         rm -f "$HASH_JOURNAL_FILE"
     fi
     local tmpfile="${HASH_CACHE_FILE}.$$"
-    > "$tmpfile"
+    : > "$tmpfile"
     local key
     for key in "${!HASH_CACHE[@]}"; do
         printf '%s|%s\n' "$key" "${HASH_CACHE[$key]}" >> "$tmpfile"
@@ -630,14 +811,18 @@ quick_file_hash() {
 # --- Cache d'inodes (position : media/cross/inconnu) ---
 load_inode_cache() {
     INODE_STATUS_CACHE=()
+    INODE_SAMPLE_PATH=()
     [ ! -f "$INODE_CACHE_FILE" ] && return
-    local inode status sample_path mtime ci
-    while IFS='|' read -r inode status sample_path mtime; do
+    local inode status sample_path ci
+    while IFS='|' read -r inode status sample_path _; do
         [ -z "$inode" ] && continue
         # Vérification : le fichier sample existe-t-il encore avec le même inode ?
         if [ -n "$sample_path" ] && [ -f "$sample_path" ]; then
             ci=$(stat -c '%i' "$sample_path" 2>/dev/null || echo "0")
-            [ "$ci" = "$inode" ] && INODE_STATUS_CACHE["$inode"]="$status"
+            if [ "$ci" = "$inode" ]; then
+                INODE_STATUS_CACHE["$inode"]="$status"
+                INODE_SAMPLE_PATH["$inode"]="$sample_path"
+            fi
         fi
     done < "$INODE_CACHE_FILE"
     printf '   📦 Cache inodes : %d entrées\n' "${#INODE_STATUS_CACHE[@]}"
@@ -645,8 +830,15 @@ load_inode_cache() {
 
 # Écriture incrémentale (append) d'une entrée du cache d'inodes ; la
 # réécriture complète et propre du fichier se fait via save_inode_cache_bulk.
+# CORRECTION : on alimente aussi le cache EN MÉMOIRE. Sans ça, les inodes
+# découverts pendant ce run n'existaient que dans les lignes appendées au
+# fichier — que save_inode_cache_bulk écrasait ensuite intégralement (`mv`)
+# en n'y remettant que les entrées chargées au démarrage. Les découvertes du
+# run étaient donc systématiquement perdues.
 save_inode_entry() {
     local inode="$1" status="$2" sample_path="$3"
+    INODE_STATUS_CACHE["$inode"]="$status"
+    INODE_SAMPLE_PATH["$inode"]="$sample_path"
     printf '%s|%s|%s|%s\n' "$inode" "$status" "$sample_path" "$(date +%s)" >> "$INODE_CACHE_FILE"
 }
 
@@ -654,25 +846,50 @@ save_inode_entry() {
 save_inode_cache_bulk() {
     [ "${#INODE_STATUS_CACHE[@]}" -eq 0 ] && return
     local tmpfile="${INODE_CACHE_FILE}.$$"
-    > "$tmpfile"
-    local inode
+    : > "$tmpfile"
+    local inode now sample
+    now=$(date +%s)
     for inode in "${!INODE_STATUS_CACHE[@]}"; do
-        # On ne peut pas restaurer le sample_path, on laisse vide
-        printf '%s|%s||%s\n' "$inode" "${INODE_STATUS_CACHE[$inode]}" "$(date +%s)" >> "$tmpfile"
+        # CORRECTION : le fichier témoin DOIT être réécrit. Il était laissé
+        # vide ici, alors que load_inode_cache rejette toute entrée sans
+        # témoin existant : l'intégralité du cache était donc invalidée au
+        # rechargement suivant (« Cache inodes : 0 entrées » à chaque run) et
+        # la Phase 3 réanalysait tout à chaque fois.
+        sample="${INODE_SAMPLE_PATH[$inode]:-}"
+        [ -z "$sample" ] && continue
+        printf '%s|%s|%s|%s\n' "$inode" "${INODE_STATUS_CACHE[$inode]}" "$sample" "$now" >> "$tmpfile"
     done
     mv "$tmpfile" "$INODE_CACHE_FILE" 2>/dev/null
 }
 
 # --- Cache de statut des torrents ---
+# CORRECTION : application effective du TTL. Le timestamp était écrit et
+# relu, mais jamais confronté à une durée de validité — les statuts
+# « no_media », « orphan » et « delete_ready » (que les Phases 3 et 4
+# court-circuitent depuis le cache) étaient donc définitifs. On filtre les
+# entrées périmées ici, en un seul point : les trois phases les voient alors
+# naturellement comme absentes et reclassifient le torrent de zéro.
 load_torrent_cache() {
     TORRENT_CACHE=()
     [ ! -f "$TORRENT_CACHE_FILE" ] && return
-    local hash instance status timestamp
+    local hash instance status timestamp now expired=0
+    now=$(date +%s)
     while IFS='|' read -r hash instance status timestamp; do
         [ -z "$hash" ] && continue
+        if [[ "$timestamp" =~ ^[0-9]+$ ]] && \
+           [ "$TORRENT_STATUS_TTL" -gt 0 ] && \
+           [ "$((now - timestamp))" -ge "$TORRENT_STATUS_TTL" ]; then
+            expired=$((expired + 1))
+            continue
+        fi
         TORRENT_CACHE["${hash}|${instance}"]="${status}|${timestamp}"
     done < "$TORRENT_CACHE_FILE"
-    printf '   📦 Cache torrents : %d entrées\n' "${#TORRENT_CACHE[@]}"
+    if [ "$expired" -gt 0 ]; then
+        printf '   📦 Cache torrents : %d entrées (%d périmée(s) ignorée(s))\n' \
+            "${#TORRENT_CACHE[@]}" "$expired"
+    else
+        printf '   📦 Cache torrents : %d entrées\n' "${#TORRENT_CACHE[@]}"
+    fi
 }
 
 save_torrent_entry() {
@@ -729,7 +946,7 @@ load_torrent_list_cache() {
 save_torrent_list_cache() {
     [ "${#TORRENT_NAMES[@]}" -eq 0 ] && return
     local tmpfile="${TORRENT_LIST_FILE}.$$"
-    > "$tmpfile"
+    : > "$tmpfile"
     local hash
     for hash in "${!TORRENT_NAMES[@]}"; do
         printf '%s|%s|%s|%s|%s|%s|%s\n' \
@@ -742,35 +959,63 @@ save_torrent_list_cache() {
 
 
 # Sauvegarde atomique complète du cache torrent (remplace les append infinis)
+# CORRECTION : purge des torrents qui n'existent plus dans qBittorrent. Le
+# fichier n'était jamais élagué et grossissait indéfiniment, run après run,
+# en conservant des hashes supprimés depuis longtemps.
+# La purge n'a lieu que si la liste des torrents a bien été récupérée : en
+# cas d'interruption avant la Phase 0, TORRENT_NAMES est vide et tout élaguer
+# reviendrait à effacer le cache.
 save_torrent_cache_bulk() {
     [ "${#TORRENT_CACHE[@]}" -eq 0 ] && return
+    local prune=false
+    [ "${#TORRENT_NAMES[@]}" -gt 0 ] && prune=true
     local tmpfile="${TORRENT_CACHE_FILE}.$$"
-    > "$tmpfile"
-    local key
+    : > "$tmpfile"
+    local key hash_part
     for key in "${!TORRENT_CACHE[@]}"; do
+        if $prune; then
+            hash_part="${key%%|*}"
+            [ -z "${TORRENT_NAMES[$hash_part]+set}" ] && continue
+        fi
         printf '%s|%s\n' "$key" "${TORRENT_CACHE[$key]}" >> "$tmpfile"
     done
     mv "$tmpfile" "$TORRENT_CACHE_FILE" 2>/dev/null
 }
 
 # --- Cache des inodes Arr ---
+# Format : inode|chemin|provenance   (provenance = "api" ou "scan")
 load_arr_inodes() {
     ARR_MANAGED_INODES=()
+    ARR_INODE_SOURCE=()
+    ARR_CACHE_LEGACY=false
     [ ! -f "$ARR_INODES_FILE" ] && return
-    local inode path
-    while IFS='|' read -r inode path; do
+    local inode path src
+    while IFS='|' read -r inode path src; do
         [ -z "$inode" ] && continue
-        [ -f "$path" ] && ARR_MANAGED_INODES["$inode"]="$path"
+        [ -f "$path" ] || continue
+        if [ -z "$src" ]; then
+            # Fichier écrit par une version antérieure, sans provenance.
+            ARR_CACHE_LEGACY=true
+            src="scan"
+        fi
+        ARR_MANAGED_INODES["$inode"]="$path"
+        ARR_INODE_SOURCE["$inode"]="$src"
     done < "$ARR_INODES_FILE"
-    printf '   📦 Cache Arr inodes : %d entrées\n' "${#ARR_MANAGED_INODES[@]}"
+    if $ARR_CACHE_LEGACY; then
+        printf "   📦 Cache Arr inodes : %d entrées (format obsolète → réinterrogation de l’API)\n" \
+            "${#ARR_MANAGED_INODES[@]}"
+    else
+        printf '   📦 Cache Arr inodes : %d entrées\n' "${#ARR_MANAGED_INODES[@]}"
+    fi
 }
 
 save_arr_inodes_bulk() {
     local tmpfile="${ARR_INODES_FILE}.$$"
-    > "$tmpfile"
+    : > "$tmpfile"
     local inode
     for inode in "${!ARR_MANAGED_INODES[@]}"; do
-        printf '%s|%s\n' "$inode" "${ARR_MANAGED_INODES[$inode]}" >> "$tmpfile"
+        printf '%s|%s|%s\n' "$inode" "${ARR_MANAGED_INODES[$inode]}" \
+            "${ARR_INODE_SOURCE[$inode]:-scan}" >> "$tmpfile"
     done
     mv "$tmpfile" "$ARR_INODES_FILE" 2>/dev/null
 }
@@ -928,8 +1173,15 @@ qbit_remove_tags() {
 # sans appel API : c'est apply_tag_batches/remove_tags_batches qui envoient
 # réellement les requêtes à qBittorrent, par lots de 90 (l'API en accepte
 # ~100 par requête).
+# CORRECTION : ajout idempotent. Un même hash pouvait être inséré deux fois
+# dans le même lot (Phase 2 classe et met en cache, Phase 4 relit ce cache et
+# réinsère). La Phase 9 dédoublonnait bien avec `sort -u`, mais la Phase 5
+# itère la chaîne brute et réparait donc deux fois chaque torrent partiel.
 batch_add() {
     local inst="$1" tag="$2" hash="$3"
+    local seen_key="${inst}|${tag}|${hash}"
+    [ -n "${BATCH_SEEN[$seen_key]:-}" ] && return
+    BATCH_SEEN["$seen_key"]=1
     TAG_BATCHES["${inst}|${tag}"]="${TAG_BATCHES[${inst}|${tag}]}${hash} "
 }
 
@@ -939,6 +1191,7 @@ batch_remove() {
     local inst="$1" tag="$2" hash="$3"
     local current="${TAG_BATCHES[${inst}|${tag}]:-}"
     [ -z "$current" ] && return
+    unset "BATCH_SEEN[${inst}|${tag}|${hash}]"
     current=$(printf '%s' "$current" | tr ' ' '\n' | grep -Fxv "$hash" | tr '\n' ' ')
     current="${current% }"
     TAG_BATCHES["${inst}|${tag}"]="${current:+${current} }"
@@ -1013,12 +1266,19 @@ remove_tags_batches() {
 # d'endpoint global fiable (episodefile sans seriesId retourne parfois HTTP
 # 400), donc un appel par série est nécessaire — mais rien n'empêche de les
 # faire en parallèle plutôt que strictement l'un après l'autre.
+# Appelée indirectement via xargs + export -f — d'où SC2317.
+# shellcheck disable=SC2317
 _fetch_sonarr_episodefile() {
-    local series_id="$1" url="$2" key="$3" outdir="$4"
+    local series_id="$1" url="$2" outdir="$3"
+    # CORRECTION SÉCURITÉ : la clé arrive par l'environnement (SONARR_API_KEY),
+    # plus en argument. Elle était auparavant passée en paramètre positionnel à
+    # `bash -c` via xargs, ce qui la rendait lisible en clair dans `ps aux` /
+    # /proc/<pid>/cmdline — sur le processus xargs ET sur chacun des 8 bash
+    # concurrents, pendant toute la durée du fetch Sonarr. Cela annulait
+    # exactement la protection que `-K -` est censé apporter ici.
+    # L'environnement d'un processus n'est lisible que par son propriétaire.
+    local key="${SONARR_API_KEY:-}"
     local resp
-    # Clé API passée via -K - (stdin), pas en argument -H, pour ne pas
-    # l'exposer dans `ps aux` — d'autant plus visible ici avec jusqu'à 8
-    # appels curl concurrents (voir fetch_arr_inodes_bulk).
     resp=$(curl -s --connect-timeout 10 --max-time 30 -K - \
         "${url}/api/v3/episodefile?seriesId=${series_id}" <<CURLCFG 2>/dev/null
 header = "X-Api-Key: $(_curl_cfg_escape "$key")"
@@ -1085,7 +1345,7 @@ except Exception as e:
             printf 'OK\n'
         else
             printf '⚠️ HTTP %s\n' "$http_code"
-            > "$cache_raw"
+            : > "$cache_raw"
         fi
 
     elif [ "$app" = "sonarr" ]; then
@@ -1104,9 +1364,9 @@ CURLCFG
 
         if [ "$http_code" != "200" ]; then
             printf '⚠️ HTTP %s (series)\n' "$http_code"
-            > "$cache_raw"
+            : > "$cache_raw"
         else
-            > "$cache_raw"
+            : > "$cache_raw"
             local series_count
             series_count=$(printf '%s' "$payload" | python3 -c "
 import sys, json
@@ -1133,7 +1393,8 @@ try:
         if sid:
             print(sid)
 except: pass
-" | xargs -P 8 -I{} bash -c '_fetch_sonarr_episodefile "$@"' _ {} "$url" "$key" "$parallel_dir"
+" | SONARR_API_KEY="$key" xargs -P 8 -I{} \
+                        bash -c '_fetch_sonarr_episodefile "$@"' _ {} "$url" "$parallel_dir"
                 cat "$parallel_dir"/*.txt > "$cache_raw" 2>/dev/null
                 rm -rf "$parallel_dir"
             fi
@@ -1142,20 +1403,27 @@ except: pass
                 printf 'OK (%s séries)\n' "$series_count"
             else
                 printf '⚠️ vide\n'
-                > "$cache_raw"
+                : > "$cache_raw"
             fi
         fi
     fi
 
-    # Fallback si l'API est vide ou inaccessible
+    # Fallback si l'API est vide ou inaccessible.
+    # CORRECTION : dernier `find` du script (les autres parcours sont passés
+    # à scan_files), et il ne cherchait que 4 extensions codées en dur là où
+    # MEDIA_EXTENSIONS_CSV en couvre 9 — les .m4v/.mov/.webm de la
+    # bibliothèque étaient invisibles pour ce repli.
+    local from_api=true
     if [ ! -s "$cache_raw" ]; then
         printf '⚠️ API vide, scan filesystem... '
-        > "$cache_raw"
+        # Ces chemins ne sont PAS déclarés par les Arr : ils ne doivent pas
+        # compter comme "api", sans quoi la Phase 7 les tiendrait pour gérés.
+        from_api=false
+        : > "$cache_raw"
         local media_path
         for media_path in "${MEDIA_DIRS[@]}"; do
-            [ -d "$media_path" ] && \
-                find "$media_path" -type f \( -name "*.mkv" -o -name "*.mp4" -o \
-                    -name "*.avi" -o -name "*.ts" \) 2>/dev/null >> "$cache_raw"
+            [ -d "$media_path" ] || continue
+            scan_files "$MEDIA_EXTENSIONS_CSV" "$media_path" | cut -f3- >> "$cache_raw"
         done
     fi
 
@@ -1174,9 +1442,11 @@ except: pass
     done < "$cache_raw"
 
     if [ "${#host_paths[@]}" -gt 0 ]; then
-        local inode hpath_stated
+        local inode hpath_stated src="scan"
+        $from_api && src="api"
         while IFS=$'\t' read -r inode hpath_stated; do
             ARR_MANAGED_INODES["$inode"]="$hpath_stated"
+            ARR_INODE_SOURCE["$inode"]="$src"
             count=$((count + 1))
         done < <(printf '%s\n' "${host_paths[@]}" | stat_paths_bulk)
     fi
@@ -1285,24 +1555,41 @@ try_repair_file() {
     printf '       📄 %s (%d octets)\n' "$fname" "$fsize"
     [ -n "$norm_orphan" ] && printf '       🏷️  « %s »\n' "$norm_orphan"
 
-    # Candidats : même taille, même filesystem. scan_files_by_size renvoie
-    # déjà l'inode de chaque candidat (CORRECTION PERF : un seul processus
-    # Python par MEDIA_DIRS au lieu d'un `find` + un `stat` par candidat).
+    # Candidats : même taille, même filesystem.
+    # CORRECTION PERF : lecture dans l'index taille → candidats construit une
+    # seule fois en Phase 1 (voir build_media_size_index). Auparavant, chaque
+    # fichier orphelin déclenchait un parcours COMPLET de chacun des
+    # MEDIA_DIRS — soit, pour N orphelins et 5 répertoires, 5×N parcours
+    # intégraux de la bibliothèque. L'index rend la recherche immédiate.
     local -a all_candidates=() all_candidate_inodes=()
-    local media_dir media_dev
-    for media_dir in "${MEDIA_DIRS[@]}"; do
-        [ ! -d "$media_dir" ] && continue
-        media_dev=$(get_fs_id "$media_dir")
-        if [ "$orphan_dev" -ne "$media_dev" ]; then
-            debug_log "try_repair_file : $media_dir ignoré (device $media_dev ≠ device orphelin $orphan_dev, hardlink impossible)"
-            continue
-        fi
-        local c_inode2 c_size2 c
-        while IFS=$'\t' read -r c_inode2 c_size2 c; do
+    if $MEDIA_SIZE_INDEX_READY; then
+        local c_dev c_inode2 c
+        while IFS=$'\t' read -r c_dev c_inode2 c; do
+            [ -z "$c" ] && continue
+            if [ "$c_dev" != "$orphan_dev" ]; then
+                debug_log "try_repair_file : $c ignoré (device $c_dev ≠ device orphelin $orphan_dev, hardlink impossible)"
+                continue
+            fi
             all_candidates+=("$c")
             all_candidate_inodes+=("$c_inode2")
-        done < <(scan_files_by_size "$fsize" "$media_dir")
-    done
+        done <<< "${MEDIA_SIZE_INDEX[$fsize]:-}"
+    else
+        # Repli si l'index n'a pas pu être construit : parcours direct.
+        local media_dir media_dev
+        for media_dir in "${MEDIA_DIRS[@]}"; do
+            [ ! -d "$media_dir" ] && continue
+            media_dev=$(get_fs_id "$media_dir")
+            if [ "$orphan_dev" -ne "$media_dev" ]; then
+                debug_log "try_repair_file : $media_dir ignoré (device $media_dev ≠ device orphelin $orphan_dev)"
+                continue
+            fi
+            local c_inode3 c2
+            while IFS=$'\t' read -r c_inode3 _ c2; do
+                all_candidates+=("$c2")
+                all_candidate_inodes+=("$c_inode3")
+            done < <(scan_files_by_size "$fsize" "$media_dir")
+        done
+    fi
 
     local total_candidates=${#all_candidates[@]}
     printf '       🔍 %d candidat(s) de même taille\n' "$total_candidates"
@@ -1487,7 +1774,7 @@ load_tracker_secrets() {
 
 save_tracker_secrets() {
     local tmpfile="${TRACKER_SECRETS_FILE}.$$"
-    > "$tmpfile"
+    : > "$tmpfile"
     local domain
     for domain in "${!TRACKER_MIN_SEED[@]}"; do
         printf '%s=%s\n' "$domain" "${TRACKER_MIN_SEED[$domain]}" >> "$tmpfile"
@@ -1511,7 +1798,7 @@ ask_tracker_min_seed() {
         while true; do
             read -r -p "Durée min seed (h) pour [$domain] ? " hours
             [[ "$hours" =~ ^[0-9]+$ ]] && break
-            printf '   Entrée invalide. Entrez un nombre entier d’heures (ex: 72).\n'
+            printf "   Entrée invalide. Entrez un nombre entier d’heures (ex: 72).\n"
         done
     else
         printf '⚠️ Tracker [%s] inconnu et mode non-interactif. Durée infinie appliquée.\n' "$domain" >&2
@@ -1623,7 +1910,23 @@ phase7_scan_disk_orphans() {
         return 1
     fi
 
-    printf '   Répertoires configurés : %d\n' "${#MEDIA_DIRS[@]}"
+    # Cette phase ne sait juger que par rapport à ce que les Arr revendiquent.
+    # Si l'API n'a rien renvoyé (instance injoignable, clé invalide, repli
+    # filesystem), aucun inode n'est marqué "api" et TOUTE la bibliothèque
+    # ressemblerait à un orphelin géant. On préfère ne rien affirmer.
+    local api_inodes=0 src_inode
+    for src_inode in "${!ARR_INODE_SOURCE[@]}"; do
+        [ "${ARR_INODE_SOURCE[$src_inode]}" = "api" ] && api_inodes=$((api_inodes + 1))
+    done
+    if [ "$api_inodes" -eq 0 ]; then
+        printf "   ⚠️  Aucun fichier revendiqué par l’API Radarr/Sonarr : impossible de\n" >&2
+        printf "      distinguer un orphelin d’un fichier géré. Phase ignorée.\n" >&2
+        printf '═══════════════════════════════════════════════════════════════\n\n'
+        return 1
+    fi
+
+    printf "   Répertoires configurés : %d (%d fichier(s) revendiqué(s) par l’API)\n" \
+        "${#MEDIA_DIRS[@]}" "$api_inodes"
 
     local disk_orphan_log="${DISK_ORPHAN_LOG}"
     local min_size="${DISK_ORPHAN_MIN_SIZE}"
@@ -1645,7 +1948,7 @@ phase7_scan_disk_orphans() {
     for hash in "${!TORRENT_NAMES[@]}"; do
         hpath="${TORRENT_HOST_PATH[$hash]:-}"
         [ ! -e "$hpath" ] && continue
-        while IFS=$'\t' read -r finode fsize2 f; do
+        while IFS=$'\t' read -r finode _ f; do
             [ "$finode" = "0" ] && continue
             TORRENT_INODE_HASH["$finode"]="$hash"
         done < <(scan_files "" "$hpath")
@@ -1680,7 +1983,14 @@ phase7_scan_disk_orphans() {
             [ "$finode" = "0" ] && continue
             [ "$fsize" -lt "$min_size" ] && continue
 
-            [ -n "${ARR_MANAGED_INODES[$finode]:-}" ] && continue
+            # CORRECTION : on teste la PROVENANCE, pas la simple présence
+            # dans ARR_MANAGED_INODES. Cet ensemble contient aussi tous les
+            # fichiers ajoutés par scan_media_dirs_for_inodes, c'est-à-dire
+            # l'intégralité de MEDIA_DIRS — exactement ce que cette phase
+            # parcourt. Le filtre était donc toujours vrai et la Phase 7 ne
+            # remontait jamais le moindre orphelin. Seul un fichier
+            # explicitement revendiqué par l'API Arr compte comme géré.
+            [ "${ARR_INODE_SOURCE[$finode]:-}" = "api" ] && continue
             [ -n "${TORRENT_INODE_HASH[$finode]:-}" ] && continue
 
             disk_orphan_count=$((disk_orphan_count + 1))
@@ -1726,12 +2036,18 @@ main() {
     fi
     printf '📁 Configuration : %s\n' "$CONFIG_FILE"
     printf '📁 Cache         : %s\n' "$CACHE_DIR"
+    printf '📁 Temporaires   : %s (%s)\n' "$TMPDIR" \
+        "$(stat -f -c '%T' "$TMPDIR" 2>/dev/null || echo 'type inconnu')"
     printf '\n'
 
     if ! command -v curl &>/dev/null; then printf '❌ curl requis\n'; exit 1; fi
     if ! command -v python3 &>/dev/null; then printf '❌ python3 requis\n'; exit 1; fi
     pick_hash_tool
     printf '🔧 Hachage : %s\n' "$HASH_CMD"
+
+    # Mémo de parcours des fichiers de torrents, valable le temps du run.
+    # Supprimé par save_all_caches (fin normale comme interruption).
+    SCAN_MEMO_DIR=$(mktemp -d "${TMPDIR}/check_hardlinks_scan.XXXXXX") || SCAN_MEMO_DIR=""
     printf '\n'
 
     if $NO_CACHE; then
@@ -1835,7 +2151,8 @@ for t in data:
     printf '═══════════════════════════════════════════════════════════════\n'
 
     local need_fetch_arr=true
-    if [ "$ARR_CACHE_DURATION" -gt 0 ] && [ "${#ARR_MANAGED_INODES[@]}" -gt 0 ]; then
+    if [ "$ARR_CACHE_DURATION" -gt 0 ] && [ "${#ARR_MANAGED_INODES[@]}" -gt 0 ] \
+       && ! $ARR_CACHE_LEGACY; then
         local age
         age=$(( $(date +%s) - $(stat -c '%Y' "$ARR_INODES_FILE" 2>/dev/null || echo 0) ))
         [ "$age" -lt "$ARR_CACHE_DURATION" ] && need_fetch_arr=false
@@ -1959,7 +2276,7 @@ for t in data:
         all_arr=true
         any_file=false
         any_cross=false
-        while IFS=$'\t' read -r finode fsize2 f; do
+        while IFS=$'\t' read -r finode _ f; do
             any_file=true
             if [ -n "${ARR_MANAGED_INODES[$finode]:-}" ]; then
                 found_arr=true
@@ -1974,7 +2291,7 @@ for t in data:
             else
                 INODE_IN_CROSS["$finode"]=false
             fi
-        done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
+        done < <(scan_torrent_files "$hash" "$hpath")
 
         if $any_file && $found_arr && $all_arr; then
             if $any_cross; then
@@ -2031,10 +2348,10 @@ for t in data:
         [ -z "$hpath" ] && continue
         [ ! -e "$hpath" ] && continue
 
-        while IFS=$'\t' read -r finode fsize2 f; do
+        while IFS=$'\t' read -r finode _ f; do
             [ "$finode" = "0" ] && continue
             printf '%s|%s|%s\n' "$finode" "$hash" "$f" >> "$all_files_tmp"
-        done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
+        done < <(scan_torrent_files "$hash" "$hpath")
         unprocessed=$((unprocessed + 1))
     done
 
@@ -2182,14 +2499,14 @@ for t in data:
         all_in_media=true
         any_cross=false
         file_count=0
-        while IFS=$'\t' read -r finode fsize2 f; do
+        while IFS=$'\t' read -r finode _ f; do
             file_count=$((file_count + 1))
             if [ "${INODE_IN_MEDIA[$finode]:-false}" = true ]; then
                 [ "${INODE_IN_CROSS[$finode]:-false}" = true ] && any_cross=true
             else
                 all_in_media=false
             fi
-        done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
+        done < <(scan_torrent_files "$hash" "$hpath")
 
         # CORRECTION : torrent sans fichier média
         if [ "$file_count" -eq 0 ]; then
@@ -2261,6 +2578,17 @@ for t in data:
         printf 'PHASE 5 — Réparation des orphelins/partiels\n'
         printf '═══════════════════════════════════════════════════════════════\n'
 
+        # Seuls les fichiers revendiqués par Radarr/Sonarr servent de cible.
+        if [ "${#MEDIA_SIZE_INDEX[@]}" -eq 0 ]; then
+            printf '   ⚠️  Index de réparation vide : aucun fichier revendiqué par les API\n'
+            printf '      Radarr/Sonarr. Aucune réparation ne sera tentée (les fichiers\n'
+            printf '      présents dans MEDIA_DIRS mais inconnus des Arr ne sont pas des\n'
+            printf '      cibles valides).\n'
+        else
+            printf '   🗂️  Index de réparation : %d taille(s) distincte(s) issues des Arr\n' \
+                "${#MEDIA_SIZE_INDEX[@]}"
+        fi
+
         # On traite les lots Orphelin ET Partiel : un pack de saison
         # partiellement lié doit lui aussi tenter de réparer ses épisodes
         # manquants, pas seulement les torrents 100% orphelins.
@@ -2288,14 +2616,14 @@ for t in data:
                     # seulement "partial" (au lieu de tout-ou-rien comme avant,
                     # ce qui ratait les torrents partiellement réparés).
                     local needs_repair=0 fixed=0
-                    while IFS=$'\t' read -r finode fsize2 f; do
+                    while IFS=$'\t' read -r finode _ f; do
                         [ "${INODE_IN_MEDIA[$finode]:-false}" = true ] && continue
                         needs_repair=$((needs_repair + 1))
                         if try_repair_file "$f"; then
                             repaired_count=$((repaired_count + 1))
                             fixed=$((fixed + 1))
                         fi
-                    done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath")
+                    done < <(scan_torrent_files "$hash" "$hpath")
 
                     # En dry-run, create_hardlink_atomic n'écrit rien : $fixed
                     # ne reflète qu'une simulation. On ne doit surtout pas
@@ -2341,6 +2669,11 @@ for t in data:
         fi
         printf '\n'
     fi
+
+    # La Phase 5 remplace des fichiers par des hardlinks : leurs inodes ont
+    # changé. Toute mémoïsation de parcours antérieure est donc périmée et ne
+    # doit pas être réutilisée par la Phase 7.
+    reset_scan_memo
 
     # -------------------------------------------------------------------------
     # PHASE 6 : Vérification durée minimale de seed par tracker
@@ -2501,16 +2834,39 @@ for t in data:
 # FONCTION AUXILIAIRE : scan direct des médias pour compléter les inodes Arr
 # =============================================================================
 
+# Complète ARR_MANAGED_INODES avec tout ce que contient réellement
+# MEDIA_DIRS : ces fichiers sont bien « dans la bibliothèque » (ce qui suffit
+# aux Phases 2 à 5), mais ils ne sont PAS revendiqués par Radarr/Sonarr — ils
+# sont donc marqués "scan" et non "api", faute de quoi la Phase 7 les
+# considérerait comme gérés et ne pourrait plus rien détecter.
 scan_media_dirs_for_inodes() {
-    local media_path f minode fsize2
+    local media_path f minode msize media_dev
+    MEDIA_SIZE_INDEX=()
     for media_path in "${MEDIA_DIRS[@]}"; do
         [ -d "$media_path" ] || continue
-        while IFS=$'\t' read -r minode fsize2 f; do
+        # Device du répertoire, capturé une fois : un hardlink n'est possible
+        # qu'entre fichiers du même système de fichiers.
+        media_dev=$(get_fs_id "$media_path")
+        while IFS=$'\t' read -r minode msize f; do
             [ "$minode" = "0" ] && continue
-            [ -n "${ARR_MANAGED_INODES[$minode]:-}" ] && continue
+            if [ -n "${ARR_MANAGED_INODES[$minode]:-}" ]; then
+                # Déjà indexé par l'API : c'est une cible de réparation
+                # légitime, on l'ajoute à l'index par taille.
+                [ "${ARR_INODE_SOURCE[$minode]:-}" = "api" ] && \
+                    MEDIA_SIZE_INDEX["$msize"]+="${media_dev}"$'\t'"${minode}"$'\t'"${f}"$'\n'
+                continue
+            fi
+            # Présent sur le disque mais non revendiqué par les Arr : compte
+            # comme « déjà dans la bibliothèque » pour la détection (Phases 2
+            # à 4), mais JAMAIS comme cible de réparation — c'est justement
+            # ce que la Phase 7 signale comme orphelin de disque à nettoyer.
+            # Y hardlinker un torrent ne ferait qu'un gain illusoire, annulé
+            # dès que le fichier serait supprimé.
             ARR_MANAGED_INODES["$minode"]="$f"
+            ARR_INODE_SOURCE["$minode"]="scan"
         done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$media_path")
     done
+    MEDIA_SIZE_INDEX_READY=true
     save_arr_inodes_bulk
 }
 
@@ -2520,8 +2876,8 @@ scan_cross_seed_dir_for_inodes() {
     CROSS_SEED_INODES=()
     [ -z "$CROSS_SEED_DIR" ] && return
     [ -d "$CROSS_SEED_DIR" ] || return
-    local f cinode fsize2
-    while IFS=$'\t' read -r cinode fsize2 f; do
+    local f cinode
+    while IFS=$'\t' read -r cinode _ f; do
         [ "$cinode" = "0" ] && continue
         CROSS_SEED_INODES["$cinode"]="$f"
     done < <(scan_files "$MEDIA_EXTENSIONS_CSV" "$CROSS_SEED_DIR")

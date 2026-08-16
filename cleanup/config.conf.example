@@ -116,10 +116,20 @@ STOPWORDS=(
 # 3600 = 1 heure (défaut)
 ARR_CACHE_DURATION=3600
 
+# Durée de validité d'un statut de torrent mis en cache, en secondes.
+# Passé ce délai, le torrent est reclassifié intégralement plutôt que de
+# conserver indéfiniment un verdict qui a pu devenir faux.
+# 86400 = 24 heures (défaut). 0 = pas d'expiration (déconseillé).
+TORRENT_STATUS_TTL=86400
+
 # -----------------------------------------------------------------------------
 # 9. ORPHELINS DE DISQUE (Phase 7)
 # -----------------------------------------------------------------------------
 # Active le scan des fichiers médias qui ne sont gérés par personne.
+# Un fichier n'est signalé que s'il n'est PAS revendiqué par l'API
+# Radarr/Sonarr ET n'appartient à aucun torrent connu. La phase est ignorée
+# si l'API n'a rien renvoyé : sans référence fiable, tout fichier de la
+# bibliothèque ressemblerait à un orphelin.
 SCAN_DISK_ORPHANS=false
 
 # Chemin du rapport (log) à générer.

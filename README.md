@@ -78,6 +78,7 @@ Le détail de chaque réglage est commenté directement dans [`cleanup/config.co
 | 6. Réparation | `AUTO_REPAIR`, `CHOWN_FILES`, `CHOWN_USER` | Active la réparation automatique par hardlink |
 | 7. Normalisation | `STOPWORDS` | Mots ignorés lors du matching par nom de fichier |
 | 8. Cache Arr | `ARR_CACHE_DURATION` | Durée de validité (secondes) du cache des inodes Arr |
+| — | `TORRENT_STATUS_TTL` | Durée de validité (secondes) d'un statut de torrent mis en cache — défaut 86400 (24 h) |
 | 9. Orphelins de disque | `SCAN_DISK_ORPHANS`, `DISK_ORPHAN_LOG`, `DISK_ORPHAN_MIN_SIZE`, `DISK_ORPHAN_EXTENSIONS` | Phase 7 : fichiers de bibliothèque non référencés |
 
 ### Durée minimale de seed par tracker
@@ -119,17 +120,36 @@ tracker.autre.net=168
 | 2 | Marquage linked/partial | Compare les fichiers de chaque torrent aux inodes Arr — **tous** liés → `linked`, **certains** → `partial` |
 | 3 | Analyse des inodes | Pour les torrents non résolus en Phase 2 : détecte média/cross-seed par inode réel |
 | 4 | Classification finale | Statut définitif : `linked` / `cross-linked` / `no-media` / `orphan` |
-| 5 | Réparation | Si `AUTO_REPAIR=true` : hardlink des fichiers manquants des torrents `orphan`/`partial` |
+| 5 | Réparation | Si `AUTO_REPAIR=true` : hardlink des fichiers manquants des torrents `orphan`/`partial`, **uniquement vers des fichiers revendiqués par Radarr/Sonarr** |
 | 6 | Vérification durée de seed | Pour les torrents restés 100% orphelins : bascule en `à effacer` si le minimum du tracker est atteint |
-| 7 | Orphelins de disque | Si `SCAN_DISK_ORPHANS=true` : fichiers de la bibliothèque ni gérés par les Arr, ni liés à un torrent connu |
+| 7 | Orphelins de disque | Si `SCAN_DISK_ORPHANS=true` : fichiers de la bibliothèque que **l'API Radarr/Sonarr ne revendique pas** et qui ne sont liés à aucun torrent connu. Ignorée si l'API n'a rien renvoyé (impossible de trancher) |
 | 8 | Nettoyage des tags | Retire tous les anciens tags de gestion avant réapplication |
 | 9 | Application des tags | Applique les tags calculés à ce run |
 
 Un torrent `orphan` ou `partial` réparé en Phase 5 devient `linked` s'il est entièrement corrigé, ou reste `partial` si seulement une partie de ses fichiers a pu être réparée. Un torrent `partial` n'est **jamais** proposé à la suppression (Phase 6) : il contient de vrais fichiers non dupliqués ailleurs.
 
+### Ce qui compte comme « déjà dans la bibliothèque »
+
+Le script raisonne par **inode** : deux chemins qui partagent un inode sont le même contenu physique — c'est la définition d'un hardlink. Il distingue deux ensembles, et cette distinction est volontaire :
+
+| Provenance | Origine | Sert à la détection (Phases 2-4) | Sert de cible de réparation (Phase 5) |
+|---|---|---|---|
+| `api` | Fichier revendiqué par Radarr/Sonarr | ✅ | ✅ |
+| `scan` | Fichier présent dans `MEDIA_DIRS` mais inconnu des \*arr | ✅ | ❌ |
+
+**Pourquoi l'union pour la détection** : « ce torrent est-il déjà dédoublonné ? » est un fait du système de fichiers, indépendant de ce que Radarr sait. C'est aussi un garde-fou : si une API est momentanément injoignable, s'en tenir à `api` ferait basculer *tous* les torrents en `orphan`, et la Phase 6 pourrait alors les promouvoir en masse en « à effacer ».
+
+**Pourquoi `api` seul pour la réparation** : un fichier présent dans la bibliothèque mais inconnu des \*arr est précisément ce que la Phase 7 signale comme orphelin de disque à nettoyer. Y hardlinker un torrent donnerait un gain illusoire — le jour où ce fichier est supprimé, le torrent redevient une copie isolée et repasse `orphan` — tout en le faisant apparaître `linked`, ce qui masquerait le fait que l'import Arr n'a jamais eu lieu.
+
+**Sens du hardlink** : c'est le fichier **du torrent** qui est remplacé par un lien vers le fichier de la bibliothèque, jamais l'inverse — le fichier géré par Radarr/Sonarr n'est jamais touché. Note : qBittorrent gardant le fichier ouvert, l'espace disque n'est réellement libéré qu'après un recheck ou un redémarrage de qBittorrent.
+
+**Index de réparation** : les candidats sont cherchés dans un index `taille → fichiers` construit une seule fois en Phase 1, en se greffant sur le parcours de `MEDIA_DIRS` déjà effectué. Auparavant chaque fichier orphelin déclenchait un parcours complet de *chacun* des `MEDIA_DIRS` : pour 200 orphelins et 5 répertoires, un millier de parcours intégraux de la bibliothèque.
+
 **Performance de la Phase 5** : par défaut, deux fichiers de même taille sont comparés par hash rapide par échantillonnage (début/milieu/fin, ~3 Mo au lieu de tout le fichier vidéo) — un candidat qui correspond est hardlinké directement, sans hash complet. Utilisez `--full-hash` pour exiger en plus une confirmation par hash complet avant chaque hardlink (plus lent, plus rigoureux).
 
 **Performance des parcours de fichiers** : parcourir un dossier torrent ou la bibliothèque avec `find` puis lire l'inode de chaque fichier avec un `stat` externe coûte un fork+exec par fichier — sur une grosse bibliothèque, ça representait des milliers de processus juste pour lire des métadonnées. Ces parcours (Phases 2 à 5, scan de la bibliothèque, indexation Radarr/Sonarr) passent maintenant par un seul processus Python par appel (`os.walk` + `os.lstat`), qui renvoie directement inode/taille/chemin.
+
+**Mémoïsation des parcours** : le répertoire d'un même torrent était parcouru jusqu'à quatre fois par run (Phases 2, 3, 4 et 5). Le résultat est désormais mémoïsé pour la durée du run, puis invalidé après la Phase 5 (qui change les inodes en créant des hardlinks). Le mémo est écrit dans `TMPDIR`, résolu de préférence sur un tmpfs (`/dev/shm`) : ces fichiers éphémères restent donc en RAM plutôt que d'être infligés au pool de stockage. Définir `TMPDIR` explicitement force un autre emplacement.
 
 **Performance du chargement du cache torrents** : la traduction de chemin (`translate_path`, Docker → hôte via `PATH_MAP`) refaisait un tri complet des préfixes (`awk`+`sort`+`cut`, donc 3 process externes) à **chaque appel**, alors qu'elle est appelée une fois par torrent au chargement du cache. Sur une grosse liste de torrents, ça pouvait à lui seul représenter l'essentiel du temps de démarrage. Le tri est maintenant calculé une seule fois et mis en cache, `PATH_MAP` ne changeant jamais en cours de run.
 
@@ -145,9 +165,9 @@ Stockés dans `cleanup/*.txt`, ils évitent de tout recalculer à chaque run :
 |---|---|
 | `hash_cache.txt` | Hash de chaque fichier (invalidé si la taille change) |
 | `inode_status.txt` | Statut média/cross-seed de chaque inode |
-| `torrent_status.txt` | Dernier statut connu de chaque torrent |
+| `torrent_status.txt` | Dernier statut connu de chaque torrent (durée `TORRENT_STATUS_TTL`, purgé des torrents supprimés de qBittorrent) |
 | `torrent_list.txt` | Liste des torrents qBittorrent (durée `TORRENT_CACHE_DURATION`) |
-| `arr_inodes.txt` | Inodes connus de Radarr/Sonarr (durée `ARR_CACHE_DURATION`) |
+| `arr_inodes.txt` | Inodes de la bibliothèque et leur provenance — `api` (revendiqué par Radarr/Sonarr) ou `scan` (simplement présent dans `MEDIA_DIRS`). Durée `ARR_CACHE_DURATION` |
 
 Tous les caches sont sauvegardés automatiquement en cas d'interruption (Ctrl+C) et à la fin d'un run normal. Utilisez `--use-no-cache` pour forcer une réanalyse complète sans les supprimer.
 
