@@ -183,6 +183,14 @@ declare -A INODE_SAMPLE_PATH=()
 declare -A TORRENT_CACHE=()
 
 # Métadonnées torrents
+# These arrays are keyed by "HASH|INSTANCE", not by the hash alone. The same
+# torrent can live on both instances — the normal case for a cross-seed picked
+# up by an *arr — and the one fetched second used to overwrite the first: the
+# torrent was classified once, with the other instance's save_path, tagged on
+# only one of the two, and the losing copy kept its old tags for ever (Phase 8
+# no longer saw it). Observed: 7 torrents in that state, every one of them with
+# different paths on the two instances. TORRENT_CACHE already used this
+# composite key.
 declare -A TORRENT_NAMES=()
 declare -A TORRENT_INSTANCE=()
 declare -A TORRENT_SAVE_PATH=()
@@ -260,6 +268,13 @@ ARR_INODES_FILE="${CACHE_DIR}/arr_inodes.txt"
 # réinterrogation de l'API plutôt que de deviner (deviner "scan" ferait
 # remonter toute la bibliothèque en orphelins de disque au premier run).
 ARR_CACHE_LEGACY=false
+# Timestamp of the last REAL call to the Arr API, written inside
+# arr_inodes.txt: the file's mtime cannot serve, every run refreshes it
+# (see load_arr_inodes).
+ARR_FETCHED_AT=0
+# Set by fetch_arr_inodes_bulk: did the API answer, or did we fall back to the
+# filesystem scan? A fallback is not a fetch.
+ARR_LAST_FETCH_FROM_API=false
 
 # Seuils
 HASH_MERGE_THRESHOLD=50
@@ -482,19 +497,32 @@ import os, stat, sys
 
 exts_csv = sys.argv[1]
 exts = {'.' + e.strip().lower() for e in exts_csv.split(',') if e.strip()} if exts_csv else None
+
+def emit(full, name):
+    if exts is not None and os.path.splitext(name)[1].lower() not in exts:
+        return
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+    print(f'{st.st_ino}\t{st.st_size}\t{full}')
+
 for root in sys.argv[2:]:
+    # A single-file torrent has the file itself as its path, not a directory —
+    # and os.walk over a regular file yields nothing at all. Those torrents
+    # therefore came out with zero media files and were classified « sans
+    # média », 955 out of 1918 here: half the library, including files already
+    # filed away with 3 hard links. Their inodes entered neither Phase 3's
+    # analysis nor the index that protects the library from false disk orphans
+    # in Phase 7.
+    if os.path.isfile(root):
+        emit(root, os.path.basename(root))
+        continue
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         for name in filenames:
-            if exts is not None and os.path.splitext(name)[1].lower() not in exts:
-                continue
-            full = os.path.join(dirpath, name)
-            try:
-                st = os.lstat(full)
-            except OSError:
-                continue
-            if not stat.S_ISREG(st.st_mode):
-                continue
-            print(f'{st.st_ino}\t{st.st_size}\t{full}')
+            emit(os.path.join(dirpath, name), name)
 " "$exts_csv" "$@"
 }
 
@@ -508,17 +536,18 @@ for root in sys.argv[2:]:
 # perdu au retour, et la mémoïsation n'aurait servi à rien. Un fichier, lui,
 # est bien visible par le shell parent au parcours suivant.
 #
-# Clé = hash du torrent : déjà unique, déjà hexadécimal, donc utilisable tel
-# quel comme nom de fichier sans échappement ni risque de collision.
+# Key = "HASH|INSTANCE", like the torrent arrays: the hash alone is not
+# enough, the same release can be on both instances in different directories —
+# one copy's memo would then have been used for the other.
 SCAN_MEMO_DIR=""
 
 scan_torrent_files() {
-    local hash="$1" hpath="$2"
+    local key="$1" hpath="$2"
     if [ -z "$SCAN_MEMO_DIR" ]; then
         scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath"
         return 0
     fi
-    local memo="${SCAN_MEMO_DIR}/${hash}"
+    local memo="${SCAN_MEMO_DIR}/${key}"
     # -f et non -s : un torrent sans fichier média donne un mémo vide, qu'il
     # ne faut pas reconstruire à chaque phase.
     [ -f "$memo" ] || scan_files "$MEDIA_EXTENSIONS_CSV" "$hpath" > "$memo"
@@ -542,17 +571,24 @@ scan_files_by_size() {
 import os, stat, sys
 
 target_size = int(sys.argv[1])
+
+def emit(full):
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode) or st.st_size != target_size:
+        return
+    print(f'{st.st_ino}\t{st.st_size}\t{full}')
+
 for root in sys.argv[2:]:
+    # Same reason as in scan_files: a path can be a file.
+    if os.path.isfile(root):
+        emit(root)
+        continue
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         for name in filenames:
-            full = os.path.join(dirpath, name)
-            try:
-                st = os.lstat(full)
-            except OSError:
-                continue
-            if not stat.S_ISREG(st.st_mode) or st.st_size != target_size:
-                continue
-            print(f'{st.st_ino}\t{st.st_size}\t{full}')
+            emit(os.path.join(dirpath, name))
 " "$size" "$@"
 }
 
@@ -781,8 +817,13 @@ file_hash() {
 # complet (file_hash, mis en cache) n'est ensuite recalculé que pour
 # confirmer une correspondance déjà trouvée par échantillonnage, jamais pour
 # rejeter un candidat. Deux fichiers identiques ont forcément les mêmes
-# échantillons (aucun faux négatif possible) ; un éventuel faux positif est
-# rattrapé par la confirmation en hash complet avant toute action.
+# échantillons (aucun faux négatif possible).
+# BEWARE: a false positive is only caught when --full-hash is asked for. By
+# default these three samples decide alone, and the "repair" overwrites the
+# torrent's own file (mv -f) with a link to the candidate: on a 22 GB remux the
+# decision rests on 3 MiB read. This comment used to claim the opposite — that
+# the full hash confirmed before any action — which the code does only under
+# --full-hash.
 # Pas de cache disque dédié : déjà assez rapide pour être recalculé à chaque
 # appel (contrairement au hash complet, qui lui reste mis en cache).
 QUICK_HASH_SAMPLE_SIZE=$((1024 * 1024))
@@ -912,6 +953,23 @@ save_torrent_entry() {
 # --- Cache de la liste des torrents qBittorrent ---
 TORRENT_LIST_FILE="${CACHE_DIR}/torrent_list.txt"
 
+# Two defects used to reinforce each other here.
+#   1. save_torrent_list_cache runs on EVERY exit (EXIT trap, so Ctrl+C too).
+#      Interrupted mid-Phase 0, TORRENT_NAMES held only the instances fetched
+#      so far, and that partial list overwrote the complete one and became the
+#      truth for every later run. Observed: 1348 VPN torrents and ZERO DIRECT
+#      in the cache against 1454 and 471 in qBittorrent — the whole DIRECT
+#      instance invisible to the script.
+#   2. Freshness was measured on the FILE's mtime, which that same end-of-run
+#      save had just refreshed. The age measured "time since the last run",
+#      not "time since the fetch": two runs closer together than
+#      TORRENT_CACHE_DURATION renewed the cache for ever and qBittorrent was
+#      never queried again.
+# Hence a completeness marker (only a fully fetched list is written) and the
+# fetch timestamp written INSIDE the file.
+TORRENT_LIST_COMPLETE=false
+TORRENT_LIST_FETCHED_AT=0
+
 load_torrent_list_cache() {
     TORRENT_NAMES=()
     TORRENT_INSTANCE=()
@@ -921,42 +979,62 @@ load_torrent_list_cache() {
     TORRENT_SEEDING_TIME=()
     [ ! -f "$TORRENT_LIST_FILE" ] && return 1
 
-    local now age
+    local now age fetched
     now=$(date +%s)
-    age=$(( now - $(stat -c '%Y' "$TORRENT_LIST_FILE" 2>/dev/null || echo 0) ))
+    # A file with no internal timestamp comes from an earlier version: it may
+    # be partial (written on an interrupt) with no way to tell. Refetch rather
+    # than trust it.
+    fetched=$(sed -n 's/^#fetched=\([0-9][0-9]*\)$/\1/p' "$TORRENT_LIST_FILE" | head -1)
+    if [ -z "$fetched" ]; then
+        printf '   ♻️  Cache torrents qBittorrent sans horodatage (ancienne version) → récupération\n'
+        return 1
+    fi
+    age=$(( now - fetched ))
     [ "$age" -ge "$TORRENT_CACHE_DURATION" ] && return 1
 
     # tracker/seeding_time peuvent être absents (anciens fichiers de cache) :
     # ils resteront vides, ce qui déclenche le repli sur l'appel API en Phase 6.
-    local hash instance name save_path size tracker seeding_time translated hpath
+    local hash instance name save_path size tracker seeding_time translated hpath key
     while IFS='|' read -r hash instance name save_path size tracker seeding_time; do
         [ -z "$hash" ] && continue
+        case "$hash" in '#'*) continue ;; esac
         hash="${hash^^}"
         translated=$(translate_path "$save_path")
         hpath="${translated}/${name}"
-        TORRENT_NAMES["$hash"]="$name"
-        TORRENT_INSTANCE["$hash"]="$instance"
-        TORRENT_SAVE_PATH["$hash"]="$save_path"
-        TORRENT_HOST_PATH["$hash"]="$hpath"
-        TORRENT_TRACKER["$hash"]="$tracker"
-        TORRENT_SEEDING_TIME["$hash"]="$seeding_time"
+        key="${hash}|${instance}"
+        TORRENT_NAMES["$key"]="$name"
+        TORRENT_INSTANCE["$key"]="$instance"
+        TORRENT_SAVE_PATH["$key"]="$save_path"
+        TORRENT_HOST_PATH["$key"]="$hpath"
+        TORRENT_TRACKER["$key"]="$tracker"
+        TORRENT_SEEDING_TIME["$key"]="$seeding_time"
     done < "$TORRENT_LIST_FILE"
 
+    # What is read back comes from a file written complete (see
+    # save_torrent_list_cache): keep its original timestamp, do not rejuvenate it.
+    TORRENT_LIST_FETCHED_AT="$fetched"
+    TORRENT_LIST_COMPLETE=true
     printf '   📦 Cache torrents qBittorrent : %d entrées (%ss)\n' \
         "${#TORRENT_NAMES[@]}" "$age"
     return 0
 }
 
 save_torrent_list_cache() {
+    # A partial state never overwrites a complete list: without this guard an
+    # interrupt during Phase 0 cut a whole instance out of the cache, and every
+    # later run worked from that truncated list.
+    $TORRENT_LIST_COMPLETE || return
     [ "${#TORRENT_NAMES[@]}" -eq 0 ] && return
     local tmpfile="${TORRENT_LIST_FILE}.$$"
-    : > "$tmpfile"
-    local hash
-    for hash in "${!TORRENT_NAMES[@]}"; do
+    printf '#fetched=%s\n' "$TORRENT_LIST_FETCHED_AT" > "$tmpfile"
+    local key
+    for key in "${!TORRENT_NAMES[@]}"; do
+        # The file keeps hash and instance in separate columns: the composite
+        # key is rebuilt when reading.
         printf '%s|%s|%s|%s|%s|%s|%s\n' \
-            "$hash" "${TORRENT_INSTANCE[$hash]}" "${TORRENT_NAMES[$hash]}" \
-            "${TORRENT_SAVE_PATH[$hash]}" "0" \
-            "${TORRENT_TRACKER[$hash]:-}" "${TORRENT_SEEDING_TIME[$hash]:-}" >> "$tmpfile"
+            "${key%%|*}" "${TORRENT_INSTANCE[$key]}" "${TORRENT_NAMES[$key]}" \
+            "${TORRENT_SAVE_PATH[$key]}" "0" \
+            "${TORRENT_TRACKER[$key]:-}" "${TORRENT_SEEDING_TIME[$key]:-}" >> "$tmpfile"
     done
     mv "$tmpfile" "$TORRENT_LIST_FILE" 2>/dev/null
 }
@@ -975,11 +1053,12 @@ save_torrent_cache_bulk() {
     [ "${#TORRENT_NAMES[@]}" -gt 0 ] && prune=true
     local tmpfile="${TORRENT_CACHE_FILE}.$$"
     : > "$tmpfile"
-    local key hash_part
+    local key
     for key in "${!TORRENT_CACHE[@]}"; do
         if $prune; then
-            hash_part="${key%%|*}"
-            [ -z "${TORRENT_NAMES[$hash_part]+set}" ] && continue
+            # Same "HASH|INSTANCE" key on both sides: a torrent removed from
+            # one instance only is pruned for that one only.
+            [ -z "${TORRENT_NAMES[$key]+set}" ] && continue
         fi
         printf '%s|%s\n' "$key" "${TORRENT_CACHE[$key]}" >> "$tmpfile"
     done
@@ -992,10 +1071,23 @@ load_arr_inodes() {
     ARR_MANAGED_INODES=()
     ARR_INODE_SOURCE=()
     ARR_CACHE_LEGACY=false
+    ARR_FETCHED_AT=0
     [ ! -f "$ARR_INODES_FILE" ] && return
+    # Same defect as the torrent list. Freshness was judged on the file's
+    # mtime, which save_arr_inodes_bulk rewrites at every end of run AND at
+    # every media scan. The age therefore measured "time since the last run",
+    # never "time since Radarr/Sonarr were asked": twelve days were observed
+    # between arr_inodes.txt (rewritten that very morning) and
+    # arr_raw_radarr.txt, which only a real fetch writes. Meanwhile every new
+    # import was known from the disk scan alone, hence marked "scan" — and
+    # Phase 7 files a "scan" entry among the disk orphans, the list an annex
+    # script is meant to clean up.
+    ARR_FETCHED_AT=$(sed -n 's/^#fetched=\([0-9][0-9]*\)$/\1/p' "$ARR_INODES_FILE" | head -1)
+    [ -z "$ARR_FETCHED_AT" ] && ARR_FETCHED_AT=0
     local inode path src
     while IFS='|' read -r inode path src; do
         [ -z "$inode" ] && continue
+        case "$inode" in '#'*) continue ;; esac
         [ -f "$path" ] || continue
         if [ -z "$src" ]; then
             # Fichier écrit par une version antérieure, sans provenance.
@@ -1015,7 +1107,9 @@ load_arr_inodes() {
 
 save_arr_inodes_bulk() {
     local tmpfile="${ARR_INODES_FILE}.$$"
-    : > "$tmpfile"
+    # The fetch timestamp survives the rewrite: it, and not the file's mtime,
+    # says when the API last answered.
+    printf '#fetched=%s\n' "$ARR_FETCHED_AT" > "$tmpfile"
     local inode
     for inode in "${!ARR_MANAGED_INODES[@]}"; do
         printf '%s|%s|%s\n' "$inode" "${ARR_MANAGED_INODES[$inode]}" \
@@ -1455,6 +1549,7 @@ except: pass
         done < <(printf '%s\n' "${host_paths[@]}" | stat_paths_bulk)
     fi
 
+    ARR_LAST_FETCH_FROM_API=$from_api
     printf '%d fichier(s) → %d inode(s)\n' "$count" "${#ARR_MANAGED_INODES[@]}"
 }
 
@@ -1521,11 +1616,17 @@ create_hardlink_atomic() {
     err=$(cat "$err_file" 2>/dev/null)
     printf '       ❌ ln a échoué : %s\n' "$err"
 
-    # Fallback : reflink (copy-on-write) si disponible, toujours via bascule atomique
-    if command -v cp &>/dev/null && cp --reflink=auto "$source" "$tmp_link" 2>"$err_file"; then
+    # Fallback: reflink (copy-on-write) where the filesystem can do it.
+    # --reflink=auto falls back SILENTLY to a full copy when block sharing does
+    # not exist (virtiofs, NFS, ext4, ZFS without block_cloning) — which is the
+    # case for /mnt/tank here. The script then announced a "COW copy" while
+    # really duplicating tens of GB, the exact opposite of what it is meant to
+    # save. --reflink=always fails instead of copying: it is visible, and
+    # nothing is written behind your back.
+    if command -v cp &>/dev/null && cp --reflink=always "$source" "$tmp_link" 2>"$err_file"; then
         if mv -f "$tmp_link" "$target" 2>"$err_file"; then
             rm -f "$err_file"
-            printf '       ⚠️  Hardlink impossible, reflink utilisé (copie COW)\n'
+            printf '       ⚠️  Hardlink impossible, reflink utilisé (partage de blocs, pas de copie)\n'
             return 0
         fi
         err=$(cat "$err_file" 2>/dev/null)
@@ -1536,7 +1637,7 @@ create_hardlink_atomic() {
 
     err=$(cat "$err_file" 2>/dev/null)
     rm -f "$err_file" "$tmp_link" 2>/dev/null
-    printf '       ❌ Reflink aussi échoué : %s\n' "$err"
+    printf '       ❌ Reflink impossible non plus (pas de partage de blocs ici) : %s\n' "$err"
     return 1
 }
 
@@ -1687,6 +1788,7 @@ try_repair_file() {
             fi
         fi
         printf '✅ CORRESPONDANCE !\n'
+        $FULL_HASH || printf '       ⚠️  Décidé sur hash échantillonné seul (3 Mio) — --full-hash pour une confirmation intégrale\n'
         printf '       🔧 Hardlink...\n'
         if create_hardlink_atomic "$candidate" "$orphan_file"; then
             printf '       ✅ Hardlink créé !\n'
@@ -1740,6 +1842,7 @@ try_repair_file() {
                 fi
             fi
             printf '✅ CORRESPONDANCE (nom différent) !\n'
+            $FULL_HASH || printf '       ⚠️  Décidé sur hash échantillonné seul (3 Mio), noms différents — --full-hash pour une confirmation intégrale\n'
             printf '       🔧 Hardlink...\n'
             if create_hardlink_atomic "$candidate" "$orphan_file"; then
                 printf '       ✅ Hardlink créé !\n'
@@ -1781,6 +1884,13 @@ save_tracker_secrets() {
     : > "$tmpfile"
     local domain
     for domain in "${!TRACKER_MIN_SEED[@]}"; do
+        # 999999 is the conservative value applied when the question cannot be
+        # asked (non-interactive run), never an answer. Once written down it
+        # became permanent: get_tracker_min_seed_hours only asks again when the
+        # value is missing, so a single cron run pinned that tracker as "never
+        # deletable" for ever — silently. Observed on tracker.tleechreload.org,
+        # alone at 999999 when every other one was at 72.
+        [ "${TRACKER_MIN_SEED[$domain]}" = "999999" ] && continue
         printf '%s=%s\n' "$domain" "${TRACKER_MIN_SEED[$domain]}" >> "$tmpfile"
     done
     mv "$tmpfile" "$TRACKER_SECRETS_FILE" 2>/dev/null
@@ -1805,10 +1915,12 @@ ask_tracker_min_seed() {
             printf "   Entrée invalide. Entrez un nombre entier d’heures (ex: 72).\n"
         done
     else
-        printf '⚠️ Tracker [%s] inconnu et mode non-interactif. Durée infinie appliquée.\n' "$domain" >&2
+        printf '⚠️ Tracker [%s] inconnu et mode non-interactif. Durée infinie appliquée\n' "$domain" >&2
+        printf '   pour ce run seulement : relancez dans un terminal pour la renseigner.\n' >&2
         hours=999999
     fi
     TRACKER_MIN_SEED["$domain"]="$hours"
+    # Only an answer given by a person is written to disk.
     save_tracker_secrets
     printf '%s' "$hours"
 }
@@ -1848,7 +1960,7 @@ get_tracker_min_seed_hours() {
 # valeur est absente (ex. ancien cache sans ce champ).
 get_torrent_seed_hours() {
     local instance="$1" hash="$2"
-    local seeding_time="${TORRENT_SEEDING_TIME[$hash]:-}"
+    local seeding_time="${TORRENT_SEEDING_TIME[${hash}|${instance}]:-}"
 
     if [ -z "$seeding_time" ]; then
         local props
@@ -1870,7 +1982,7 @@ print(json.load(sys.stdin).get('seeding_time', 0))
 # (aucun tracker actif au moment du fetch initial).
 get_torrent_tracker_domain() {
     local instance="$1" hash="$2"
-    local url="${TORRENT_TRACKER[$hash]:-}"
+    local url="${TORRENT_TRACKER[${hash}|${instance}]:-}"
 
     if [ -n "$url" ] && [[ "$url" == http* ]]; then
         get_tracker_domain "$url"
@@ -1962,9 +2074,10 @@ phase7_scan_disk_orphans() {
     # fichiers, pas seulement les extensions média, pour ne pas rater un
     # fichier "orphelin de disque" à tort à cause d'un filtre trop strict).
     declare -A TORRENT_INODE_HASH=()
-    local hash hpath f finode
-    for hash in "${!TORRENT_NAMES[@]}"; do
-        hpath="${TORRENT_HOST_PATH[$hash]:-}"
+    local key hash hpath f finode
+    for key in "${!TORRENT_NAMES[@]}"; do
+        hash="${key%%|*}"
+        hpath="${TORRENT_HOST_PATH[$key]:-}"
         [ ! -e "$hpath" ] && continue
         while IFS=$'\t' read -r finode _ f; do
             [ "$finode" = "0" ] && continue
@@ -2127,7 +2240,10 @@ main() {
     fi
 
     local total=0
-    local json count hash name save_path size tracker seeding_time translated hpath
+    # The list is complete only if EVERY instance answered: an unreachable one
+    # would give a truncated list, which must not be cached.
+    local fetch_ok=true
+    local json count hash name save_path size tracker seeding_time translated hpath key
     for instance in "${INSTANCES[@]}"; do
         if $use_cache; then
             local inst_count=0
@@ -2140,7 +2256,11 @@ main() {
             continue
         fi
 
-        json=$(qbit_get "$instance" "/api/v2/torrents/info")
+        if ! json=$(qbit_get "$instance" "/api/v2/torrents/info"); then
+            printf '   [%s] ⚠️  liste non récupérée — cache laissé intact\n' "$instance"
+            fetch_ok=false
+            continue
+        fi
         count=$(printf '%s' "$json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
         [ -z "$count" ] && count=0
         printf '   [%s] %d torrent(s)\n' "$instance" "$count"
@@ -2153,12 +2273,13 @@ main() {
             translated=$(translate_path "$save_path")
             hpath="${translated}/${name}"
 
-            TORRENT_NAMES["$hash"]="$name"
-            TORRENT_INSTANCE["$hash"]="$instance"
-            TORRENT_SAVE_PATH["$hash"]="$save_path"
-            TORRENT_HOST_PATH["$hash"]="$hpath"
-            TORRENT_TRACKER["$hash"]="$tracker"
-            TORRENT_SEEDING_TIME["$hash"]="$seeding_time"
+            key="${hash}|${instance}"
+            TORRENT_NAMES["$key"]="$name"
+            TORRENT_INSTANCE["$key"]="$instance"
+            TORRENT_SAVE_PATH["$key"]="$save_path"
+            TORRENT_HOST_PATH["$key"]="$hpath"
+            TORRENT_TRACKER["$key"]="$tracker"
+            TORRENT_SEEDING_TIME["$key"]="$seeding_time"
         done < <(printf '%s' "$json" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
@@ -2172,6 +2293,14 @@ for t in data:
         total=$((total + count))
     done
 
+    if ! $use_cache; then
+        if $fetch_ok; then
+            TORRENT_LIST_FETCHED_AT=$(date +%s)
+            TORRENT_LIST_COMPLETE=true
+        else
+            printf "   ⚠️  Récupération incomplète : le cache de la liste n’est pas réécrit.\n"
+        fi
+    fi
     save_torrent_list_cache
     printf '   ✓ %d torrent(s) au total\n' "$total"
     printf '\n'
@@ -2188,11 +2317,16 @@ for t in data:
     printf '═══════════════════════════════════════════════════════════════\n'
 
     local need_fetch_arr=true
+    local arr_age=0
+    # The age is measured on the timestamp written in the file (#fetched=), not
+    # on its mtime: that one is refreshed at every end of run and every media
+    # scan, which kept the cache eternally "valid" and the Arr API never
+    # queried again. A file with no timestamp (earlier version) gives 0, hence
+    # a fetch.
     if [ "$ARR_CACHE_DURATION" -gt 0 ] && [ "${#ARR_MANAGED_INODES[@]}" -gt 0 ] \
-       && ! $ARR_CACHE_LEGACY; then
-        local age
-        age=$(( $(date +%s) - $(stat -c '%Y' "$ARR_INODES_FILE" 2>/dev/null || echo 0) ))
-        [ "$age" -lt "$ARR_CACHE_DURATION" ] && need_fetch_arr=false
+       && ! $ARR_CACHE_LEGACY && [ "$ARR_FETCHED_AT" -gt 0 ]; then
+        arr_age=$(( $(date +%s) - ARR_FETCHED_AT ))
+        [ "$arr_age" -lt "$ARR_CACHE_DURATION" ] && need_fetch_arr=false
     fi
 
     if $need_fetch_arr; then
@@ -2200,6 +2334,11 @@ for t in data:
             printf '   🔄 Cache Arr désactivé (ARR_CACHE_DURATION=0) → interrogation API...\n'
         fi
         ARR_MANAGED_INODES=()
+        # A fetch only counts if EVERY application really answered: a
+        # filesystem fallback is not an API answer, and stamping it would mean
+        # believing ourselves up to date for an hour with an empty "api" set —
+        # which Phase 7 reads as a library-wide pile of orphans.
+        local arr_api_ok=true
         local seen_urls=""
         local cfg_key
         for instance in "${INSTANCES[@]}"; do
@@ -2227,11 +2366,17 @@ for t in data:
 
                 printf '   [%s] %s → %s\n' "$instance" "$app" "$url"
                 fetch_arr_inodes_bulk "$app" "$url" "$key"
+                $ARR_LAST_FETCH_FROM_API || arr_api_ok=false
             done
             if ! $has_arr; then
                 printf '   [%s] ⏭️  pas configuré (aucune entrée ARR_CONFIG["%s|..."])\n' "$instance" "$instance"
             fi
         done
+        if $arr_api_ok; then
+            ARR_FETCHED_AT=$(date +%s)
+        else
+            printf "   ⚠️  Réponse API incomplète : le cache n’est pas horodaté, l’API sera réinterrogée au prochain run.\n"
+        fi
         save_arr_inodes_bulk
         printf '   ✓ %d inodes Arr chargés\n' "${#ARR_MANAGED_INODES[@]}"
 
@@ -2248,8 +2393,8 @@ for t in data:
                 "$((${#ARR_MANAGED_INODES[@]} - media_inode_count))"
         fi
     else
-        printf '   ⏭️  Cache Arr valide (%d inodes, < %ss)\n' \
-            "${#ARR_MANAGED_INODES[@]}" "$ARR_CACHE_DURATION"
+        printf '   ⏭️  Cache Arr valide (%d inodes, API interrogée il y a %ss)\n' \
+            "${#ARR_MANAGED_INODES[@]}" "$arr_age"
 
         # Même si le cache est valide, on complète avec les nouveaux fichiers
         local media_inode_count=${#ARR_MANAGED_INODES[@]}
@@ -2272,24 +2417,25 @@ for t in data:
     printf '═══════════════════════════════════════════════════════════════\n'
 
     local arr_matched=0 arr_skipped=0 arr_partial=0 arr_cross_matched=0 idx=0
-    local cache_key cached_entry cached_status hpath found_arr all_arr any_file any_cross f finode
-    for hash in "${!TORRENT_NAMES[@]}"; do
+    local key cached_entry cached_status hpath found_arr all_arr any_file any_cross f finode
+    # The key carries the instance; the bare hash is only for qBittorrent's API.
+    for key in "${!TORRENT_NAMES[@]}"; do
         idx=$((idx + 1))
-        instance="${TORRENT_INSTANCE[$hash]}"
-        cache_key="${hash}|${instance}"
-        cached_entry="${TORRENT_CACHE[$cache_key]:-}"
+        hash="${key%%|*}"
+        instance="${TORRENT_INSTANCE[$key]}"
+        cached_entry="${TORRENT_CACHE[$key]:-}"
 
         if [ -n "$cached_entry" ]; then
             cached_status="${cached_entry%|*}"
             if [ "$cached_status" = "linked" ]; then
                 batch_add "$instance" "$TAG_LINKED" "$hash"
                 arr_skipped=$((arr_skipped + 1))
-                printf '\r   [%3d/%3d] ⏭️  [%s] (caché) %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+                printf '\r   [%3d/%3d] ⏭️  [%s] (caché) %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$key]:0:50}"
                 continue
             fi
         fi
 
-        hpath="${TORRENT_HOST_PATH[$hash]:-}"
+        hpath="${TORRENT_HOST_PATH[$key]:-}"
         [ -z "$hpath" ] && continue
         [ ! -e "$hpath" ] && continue
 
@@ -2328,27 +2474,27 @@ for t in data:
             else
                 INODE_IN_CROSS["$finode"]=false
             fi
-        done < <(scan_torrent_files "$hash" "$hpath")
+        done < <(scan_torrent_files "$key" "$hpath")
 
         if $any_file && $found_arr && $all_arr; then
             if $any_cross; then
                 batch_add "$instance" "$TAG_CROSS_LINKED" "$hash"
                 save_torrent_entry "$hash" "$instance" "cross_linked"
                 arr_cross_matched=$((arr_cross_matched + 1))
-                printf '\r   [%3d/%3d] 🔗 [%s] Arr cross-linked %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+                printf '\r   [%3d/%3d] 🔗 [%s] Arr cross-linked %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$key]:0:50}"
             else
                 batch_add "$instance" "$TAG_LINKED" "$hash"
                 save_torrent_entry "$hash" "$instance" "linked"
                 arr_matched=$((arr_matched + 1))
-                printf '\r   [%3d/%3d] ✅ [%s] Arr lié %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+                printf '\r   [%3d/%3d] ✅ [%s] Arr lié %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$key]:0:50}"
             fi
         elif $found_arr; then
             batch_add "$instance" "$TAG_PARTIAL" "$hash"
             save_torrent_entry "$hash" "$instance" "partial"
             arr_partial=$((arr_partial + 1))
-            printf '\r   [%3d/%3d] 🟡 [%s] Arr partiel %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+            printf '\r   [%3d/%3d] 🟡 [%s] Arr partiel %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$key]:0:50}"
         else
-            printf '\r   [%3d/%3d] ❓ [%s] %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+            printf '\r   [%3d/%3d] ❓ [%s] %-50s' "$idx" "$total" "$instance" "${TORRENT_NAMES[$key]:0:50}"
         fi
     done
     printf '\n'
@@ -2376,19 +2522,19 @@ for t in data:
     ALL_FILES_TMP="$all_files_tmp"
     local unprocessed=0
 
-    for hash in "${!TORRENT_NAMES[@]}"; do
-        instance="${TORRENT_INSTANCE[$hash]:-}"
-        cache_key="${hash}|${instance}"
-        [ -n "${TORRENT_CACHE[$cache_key]:-}" ] && continue
+    for key in "${!TORRENT_NAMES[@]}"; do
+        hash="${key%%|*}"
+        instance="${TORRENT_INSTANCE[$key]:-}"
+        [ -n "${TORRENT_CACHE[$key]:-}" ] && continue
 
-        hpath="${TORRENT_HOST_PATH[$hash]:-}"
+        hpath="${TORRENT_HOST_PATH[$key]:-}"
         [ -z "$hpath" ] && continue
         [ ! -e "$hpath" ] && continue
 
         while IFS=$'\t' read -r finode _ f; do
             [ "$finode" = "0" ] && continue
             printf '%s|%s|%s\n' "$finode" "$hash" "$f" >> "$all_files_tmp"
-        done < <(scan_torrent_files "$hash" "$hpath")
+        done < <(scan_torrent_files "$key" "$hpath")
         unprocessed=$((unprocessed + 1))
     done
 
@@ -2483,11 +2629,12 @@ for t in data:
     printf 'PHASE 4 — Classification\n'
     printf '═══════════════════════════════════════════════════════════════\n'
 
-    local -a unclassified_hashes=()
+    local -a unclassified_keys=()
     local cached_entry4 cached_status4
-    for hash in "${!TORRENT_NAMES[@]}"; do
-        instance="${TORRENT_INSTANCE[$hash]:-}"
-        cached_entry4="${TORRENT_CACHE["${hash}|${instance}"]:-}"
+    for key in "${!TORRENT_NAMES[@]}"; do
+        hash="${key%%|*}"
+        instance="${TORRENT_INSTANCE[$key]:-}"
+        cached_entry4="${TORRENT_CACHE[$key]:-}"
         if [ -n "$cached_entry4" ]; then
             # CORRECTION : un torrent déjà classifié lors d'un run précédent
             # (pas reclassifié ici pour éviter de refaire le scan de fichiers)
@@ -2513,18 +2660,19 @@ for t in data:
             esac
             continue
         fi
-        unclassified_hashes+=("$hash")
+        unclassified_keys+=("$key")
     done
 
     local total_unclass class_idx all_in_media any_cross file_count
-    total_unclass=${#unclassified_hashes[@]}
+    total_unclass=${#unclassified_keys[@]}
     printf '   📊 %d torrent(s) à classifier\n' "$total_unclass"
     class_idx=0
-    for hash in "${unclassified_hashes[@]}"; do
+    for key in "${unclassified_keys[@]}"; do
         class_idx=$((class_idx + 1))
-        instance="${TORRENT_INSTANCE[$hash]}"
-        name="${TORRENT_NAMES[$hash]}"
-        hpath="${TORRENT_HOST_PATH[$hash]:-}"
+        hash="${key%%|*}"
+        instance="${TORRENT_INSTANCE[$key]}"
+        name="${TORRENT_NAMES[$key]}"
+        hpath="${TORRENT_HOST_PATH[$key]:-}"
         printf '   [%d/%d] %s... ' "$class_idx" "$total_unclass" "${name:0:60}"
 
         if [ ! -e "$hpath" ]; then
@@ -2543,7 +2691,7 @@ for t in data:
             else
                 all_in_media=false
             fi
-        done < <(scan_torrent_files "$hash" "$hpath")
+        done < <(scan_torrent_files "$key" "$hpath")
 
         # CORRECTION : torrent sans fichier média
         if [ "$file_count" -eq 0 ]; then
@@ -2630,15 +2778,16 @@ for t in data:
         # partiellement lié doit lui aussi tenter de réparer ses épisodes
         # manquants, pas seulement les torrents 100% orphelins.
         local orphan_count=0
-        local source_tag hashes_str
+        local source_tag hashes_str key
         for instance in "${INSTANCES[@]}"; do
             for source_tag in "$TAG_ORPHAN" "$TAG_PARTIAL"; do
                 hashes_str="${TAG_BATCHES[${instance}|${source_tag}]:-}"
                 local hash
                 for hash in $hashes_str; do
                     [ -z "$hash" ] && continue
-                    name="${TORRENT_NAMES[$hash]:-}"
-                    hpath="${TORRENT_HOST_PATH[$hash]:-}"
+                    key="${hash}|${instance}"
+                    name="${TORRENT_NAMES[$key]:-}"
+                    hpath="${TORRENT_HOST_PATH[$key]:-}"
                     orphan_count=$((orphan_count + 1))
                     printf '  ⚠️  [%d] %s\n' "$orphan_count" "${name:0:70}"
 
@@ -2660,7 +2809,7 @@ for t in data:
                             repaired_count=$((repaired_count + 1))
                             fixed=$((fixed + 1))
                         fi
-                    done < <(scan_torrent_files "$hash" "$hpath")
+                    done < <(scan_torrent_files "$key" "$hpath")
 
                     # En dry-run, create_hardlink_atomic n'écrit rien : $fixed
                     # ne reflète qu'une simulation. On ne doit surtout pas
@@ -2732,14 +2881,15 @@ for t in data:
         local -a orphan_arr=()
         read -ra orphan_arr <<< "$orphan_hashes"
 
-        local hash tracker_domain min_hours seed_hours
+        local hash tracker_domain min_hours seed_hours key
         for hash in "${orphan_arr[@]}"; do
             [ -z "$hash" ] && continue
+            key="${hash}|${instance}"
 
             tracker_domain=$(get_torrent_tracker_domain "$instance" "$hash")
             if [ -z "$tracker_domain" ]; then
                 printf '   [%s] %-50s : tracker non détecté (ignoré)\n' \
-                    "$instance" "${TORRENT_NAMES[$hash]:0:50}"
+                    "$instance" "${TORRENT_NAMES[$key]:0:50}"
                 continue
             fi
 
@@ -2748,7 +2898,7 @@ for t in data:
 
             if [ "$min_hours" -eq 999999 ]; then
                 printf '   [%s] %-50s : %s → conservatoire\n' \
-                    "$instance" "${TORRENT_NAMES[$hash]:0:50}" "$tracker_domain"
+                    "$instance" "${TORRENT_NAMES[$key]:0:50}" "$tracker_domain"
                 continue
             fi
 
@@ -2757,14 +2907,14 @@ for t in data:
 
             if [ "$seed_hours" -ge "$min_hours" ]; then
                 printf '   [%s] %-40s : %sh >= %sh (%s) → %s\n' \
-                    "$instance" "${TORRENT_NAMES[$hash]:0:40}" "$seed_hours" "$min_hours" "$tracker_domain" "$TAG_DELETE"
+                    "$instance" "${TORRENT_NAMES[$key]:0:40}" "$seed_hours" "$min_hours" "$tracker_domain" "$TAG_DELETE"
                 batch_remove "$instance" "$TAG_ORPHAN" "$hash"
                 batch_add "$instance" "$TAG_DELETE" "$hash"
                 save_torrent_entry "$hash" "$instance" "delete_ready"
                 torrent_delete_ready=$((torrent_delete_ready + 1))
             else
                 printf '   [%s] %-40s : %sh < %sh (%s) → conserve Orphelin\n' \
-                    "$instance" "${TORRENT_NAMES[$hash]:0:40}" "$seed_hours" "$min_hours" "$tracker_domain"
+                    "$instance" "${TORRENT_NAMES[$key]:0:40}" "$seed_hours" "$min_hours" "$tracker_domain"
             fi
         done
     done
@@ -2792,11 +2942,13 @@ for t in data:
     delete_tags_str=$(printf "%s," "${DELETE_TAGS[@]}" | sed 's/,$//')
     for instance in "${INSTANCES[@]}"; do
         all_hashes=""
-        local hash
+        local key
         # CORRECTION : ne garder que les torrents de CETTE instance (avant,
         # les hashes de VPN et DIRECT étaient tous envoyés aux deux instances).
-        for hash in "${!TORRENT_NAMES[@]}"; do
-            [ "${TORRENT_INSTANCE[$hash]:-}" = "$instance" ] && all_hashes="${all_hashes}${hash} "
+        # A release held by both now appears on both sides: before, the
+        # overwritten instance appeared nowhere and kept its old tags for ever.
+        for key in "${!TORRENT_NAMES[@]}"; do
+            [ "${TORRENT_INSTANCE[$key]:-}" = "$instance" ] && all_hashes="${all_hashes}${key%%|*} "
         done
         all_hashes="${all_hashes% }"
         if [ -n "$all_hashes" ]; then
