@@ -15,3 +15,8 @@ cleanup/*.lock
 
 # Sortie de --debug redirigée
 debug.log
+
+# Run logs, and the backups the script keeps beside a file it rewrites
+# — one of them is a copy of tracker_secrets.conf.
+cleanup/*.log
+*.avant
